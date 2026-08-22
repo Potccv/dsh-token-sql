@@ -1,0 +1,10 @@
+# Installs dsh-token-sql as one Loader row.
+# Config defaults are defined in src/index.ts; empty path means use
+# DSH_HOME or HOME/.dsh. If both are unset, the plugin requires an explicit path.
+- insert:
+    - id: dsh-token-sql
+      name: 'dsh-token-sql'
+      config:
+        path: ''
+        backfillOnStart: true
+        exposeWebApi: true

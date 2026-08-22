@@ -1,0 +1,11 @@
+# Build output / generated files
+lib/
+node_modules/
+*.tgz
+tsconfig.build.json
+*.tsbuildinfo
+
+# Local SQLite database files (created at runtime, not source)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
