@@ -97,15 +97,17 @@ dsh plugin --profile web remove dsh-token-sql
 
 该命令会同时移除依赖和对应的 bundle 层。
 
-### 开发热装配（可选，需 dsh-super-injector）
+### 注意：只使用官方 `dsh plugin add` 安装
 
-如果当前 DSH 环境已装配 `dsh-super-injector`，也可以让 AI 调用以下工具进行免重启热装配：
+本项目**只支持官方 `dsh plugin add` 安装流程**，不要同时使用 `dsh-super-injector` 的 `dev_install_package` / `dev_inject_plugin` 热装配。
 
-- `dev_install_package`：热装配到 profile 并写入 `dsh.profile.bundles`，重启后仍由官方装配接管。
-- `dev_inject_plugin`：仅运行时注入，不修改 profile manifest。
-- 注意：super-injector 的热装配使用 `link:` / junction，插件文件不会复制到 `node_modules/dsh-token-sql`，属于开发态；正式安装请使用上面的 `dsh plugin add file:...` 或 tarball 方式。
+如果之前用 super-injector 注入过本插件，请先执行：
 
-普通用户建议使用上面的官方 `dsh plugin add` 流程。
+```bash
+dev_uninject_plugin dsh-token-sql
+```
+
+或在 DSH 的 super-injector 管理界面中卸载，确保 `/root/.dsh/super-injector/registry.json` 中不再有 `dsh-token-sql`，然后再用官方 `dsh plugin add` 安装。否则同一插件会同时存在官方 bundle 和运行时注入两份实例，重启时可能因重复注册导致无法启动。
 
 ## 存储位置
 
@@ -119,7 +121,7 @@ dsh plugin --profile web remove dsh-token-sql
 
 - 设置了 `DSH_HOME`：使用 `${DSH_HOME}/storages/token-usage.sqlite`
 - 未设置 `DSH_HOME` 但设置了 `HOME`：使用 `${HOME}/.dsh/storages/token-usage.sqlite`
-- `DSH_HOME` 和 `HOME` 都为空：**不自动选择路径**，插件会提示必须在配置中手动设置 `path`
+- `DSH_HOME` 和 `HOME` 都为空：回退到 `os.homedir()/.dsh/storages/token-usage.sqlite`（与 DSH 自身的 home 解析一致）
 
 可通过配置 `path` 覆盖。数据库使用 WAL 模式，表结构：
 

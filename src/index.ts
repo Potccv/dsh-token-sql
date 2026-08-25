@@ -22,6 +22,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { homedir } from 'node:os'
 import { basename } from 'node:path'
 import { settingsNamespace, type SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
@@ -86,10 +87,13 @@ interface SessionMeta {
 /** Per-session accumulator: turn -> step -> usage sample. */
 type SessionTurnAccumulator = Map<number, Map<number, StepUsage>>
 
-function defaultDatabasePath(): string | null {
+function defaultDatabasePath(): string {
   if (process.env.DSH_HOME) return `${process.env.DSH_HOME}/storages/token-usage.sqlite`
   if (process.env.HOME) return `${process.env.HOME}/.dsh/storages/token-usage.sqlite`
-  return null
+  // DSH itself resolves the home with Node's os.homedir() when HOME is unset;
+  // mirror that so the plugin can start even in service/PM2 environments that
+  // do not export HOME.
+  return `${homedir()}/.dsh/storages/token-usage.sqlite`
 }
 
 function workspaceOf(session: SessionLike): string {
@@ -371,13 +375,7 @@ export function apply(ctx: PluginContext, config: Config): void {
   if (configuredPath) {
     dbPath = configuredPath
   } else {
-    const defaultPath = defaultDatabasePath()
-    if (!defaultPath) {
-      throw new Error(
-        'dsh-token-sql: 未检测到 DSH_HOME 或 HOME，无法确定默认数据库路径；请在插件配置中手动设置 path',
-      )
-    }
-    dbPath = defaultPath
+    dbPath = defaultDatabasePath()
   }
   const store: TokenUsageStore = openTokenUsageStore(dbPath)
 
