@@ -65,7 +65,7 @@ const messageStyle: React.CSSProperties = {
   color: 'var(--dsw-alias-label-secondary)',
   fontSize: 12,
   lineHeight: 1.5,
-  margin: '12px 0 0',
+  margin: '12px 0 12px',
 }
 
 const buttonStyle: React.CSSProperties = {
@@ -75,6 +75,7 @@ const buttonStyle: React.CSSProperties = {
   border: '1px solid var(--dsw-alias-border-l2)',
   borderRadius: 8,
   padding: '5px 14px',
+  marginBottom: 12,
   fontSize: 13,
   lineHeight: 1.5,
   color: 'var(--dsw-alias-label-secondary)',
