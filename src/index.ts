@@ -30,8 +30,12 @@ import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import type { Session, SessionEvent, SessionHeader, SessionStore } from '@deepseek-ai/dsh-session'
 // Type-only: merges the `session/title` SessionEventMap variant.
 import type {} from '@deepseek-ai/dsh-session-title'
-import type { TokenUsage } from '@deepseek-ai/dsh-llm'
-import { openTokenUsageStore, type TokenUsageStore, type TurnQueryOptions } from './db.ts'
+// Type-only: merges the `compaction/summary` and `web/deepseek-search-llm-request`
+// SessionEventMap variants used by the extended usage accounting.
+import type {} from '@deepseek-ai/dsh-compaction/types'
+import type {} from '@deepseek-ai/dsh-web-search-deepseek'
+import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
+import { openTokenUsageStore, type ExtraUsageKind, type TokenUsageStore, type TurnQueryOptions, type UsageTotals } from './db.ts'
 
 export const name = 'dsh-token-sql'
 export const SETTINGS_NS = settingsNamespace('dsh-token-sql')
@@ -46,12 +50,19 @@ export interface Config {
   backfillOnStart: boolean
   /** Whether to expose the read-only web API mapping at `/api/usage`. */
   exposeWebApi: boolean
+  /**
+   * Whether to install a runtime fetch interceptor that parses DeepSeek web
+   * search response usage. This avoids modifying DSH source, but monkey-patches
+   * global fetch while enabled.
+   */
+  captureWebSearchUsage: boolean
 }
 
 export const Config = z.object({
   path: z.string().default(''),
   backfillOnStart: z.boolean().default(true),
   exposeWebApi: z.boolean().default(true),
+  captureWebSearchUsage: z.boolean().default(false),
 })
 
 /** Minimal host context face this plugin consumes. */
@@ -75,6 +86,29 @@ interface StepUsage {
   provider: string | null
   model: string | null
   time: number
+}
+
+/** Unified usage record returned by the default /api/usage view. */
+interface UnifiedUsageRecord {
+  kind: 'session' | ExtraUsageKind
+  workspace: string
+  sessionId: string
+  turn: number | null
+  provider: string | null
+  model: string | null
+  uncachedInputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  requestCount: number
+  eventTime: number
+  sourceSeq: number | null
+  sessionTitle: string | null
+  sessionCreatedAt: number | null
+  sessionUpdatedAt: number | null
+  firstEventTime: number | null
+  lastEventTime: number | null
 }
 
 /** Per-session metadata tracked while folding events. */
@@ -369,6 +403,106 @@ function parseUsageQuery(url: URL): UsageQueryResult {
   }
 }
 
+function totalsFromRecords(records: UnifiedUsageRecord[]): UsageTotals {
+  const totals: UsageTotals = {
+    uncachedInputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    requestCount: 0,
+    turnCount: 0,
+    sessionCount: 0,
+    workspaceCount: 0,
+  }
+  const sessions = new Set<string>()
+  const workspaces = new Set<string>()
+  for (const record of records) {
+    totals.uncachedInputTokens += record.uncachedInputTokens
+    totals.outputTokens += record.outputTokens
+    totals.cacheReadTokens += record.cacheReadTokens
+    totals.cacheWriteTokens += record.cacheWriteTokens
+    totals.reasoningTokens += record.reasoningTokens
+    totals.requestCount += record.requestCount
+    if (record.kind === 'session') totals.turnCount += 1
+    sessions.add(record.sessionId)
+    workspaces.add(record.workspace)
+  }
+  totals.sessionCount = sessions.size
+  totals.workspaceCount = workspaces.size
+  return totals
+}
+
+interface UsageGroup {
+  key: Record<string, string | number | null>
+  uncachedInputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  requestCount: number
+  recordCount: number
+  sessionCount: number
+}
+
+function groupsFromRecords(records: UnifiedUsageRecord[], groupBy: string): UsageGroup[] {
+  const buckets = new Map<string, { group: UsageGroup; sessions: Set<string> }>()
+  for (const record of records) {
+    let key: Record<string, string | number | null>
+    switch (groupBy) {
+      case 'model':
+        key = { provider: record.provider, model: record.model }
+        break
+      case 'session':
+        key = { workspace: record.workspace, sessionId: record.sessionId }
+        break
+      case 'day':
+        key = { day: new Date(record.eventTime).toISOString().slice(0, 10) }
+        break
+      case 'kind':
+        key = { kind: record.kind }
+        break
+      case 'workspace':
+        key = { workspace: record.workspace }
+        break
+      default:
+        throw new Error(`invalid "group_by": expected model, session, day, kind, or workspace`)
+    }
+    const id = JSON.stringify(key)
+    let bucket = buckets.get(id)
+    if (bucket === undefined) {
+      bucket = {
+        group: {
+          key,
+          uncachedInputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          reasoningTokens: 0,
+          requestCount: 0,
+          recordCount: 0,
+          sessionCount: 0,
+        },
+        sessions: new Set(),
+      }
+      buckets.set(id, bucket)
+    }
+    const group = bucket.group
+    group.uncachedInputTokens += record.uncachedInputTokens
+    group.outputTokens += record.outputTokens
+    group.cacheReadTokens += record.cacheReadTokens
+    group.cacheWriteTokens += record.cacheWriteTokens
+    group.reasoningTokens += record.reasoningTokens
+    group.requestCount += record.requestCount
+    group.recordCount += 1
+    bucket.sessions.add(record.sessionId)
+  }
+  for (const bucket of buckets.values()) {
+    bucket.group.sessionCount = bucket.sessions.size
+  }
+  return [...buckets.values()].map(bucket => bucket.group)
+}
+
 export function apply(ctx: PluginContext, config: Config): void {
   const configuredPath = config.path.trim()
   let dbPath: string
@@ -388,6 +522,13 @@ export function apply(ctx: PluginContext, config: Config): void {
   const turnsBySession = new Map<SessionLike, SessionTurnAccumulator>()
   // Per-session metadata (title, created/updated timestamps).
   const metaBySession = new Map<SessionLike, SessionMeta>()
+  // Pending DeepSeek web-search requests awaiting their fetch response, keyed by
+  // exact request body. Used only when captureWebSearchUsage is enabled.
+  const pendingWebSearches = new Map<string, Array<{
+    session: SessionLike
+    sourceSeq: number
+    model: string
+  }>>()
 
   const metaOf = (session: SessionLike): SessionMeta => {
     let meta = metaBySession.get(session)
@@ -549,6 +690,78 @@ export function apply(ctx: PluginContext, config: Config): void {
       return
     }
 
+    if (event.type === 'step/end') {
+      const turns = accumulatorOf(session)
+      let steps = turns.get(event.data.turn)
+      if (steps === undefined) {
+        steps = new Map()
+        turns.set(event.data.turn, steps)
+      }
+      // A step that never reported usage is still a real model request.
+      // Count it as one request with zero known tokens; a later
+      // assistant/message usage (if any) will replace this zero sample.
+      if (!steps.has(event.data.step)) {
+        steps.set(event.data.step, {
+          usage: { inputTokens: 0, outputTokens: 0 },
+          provider: route.provider ?? null,
+          model: route.model ?? null,
+          time: event.time,
+        })
+      }
+      return
+    }
+
+    if (event.type === 'compaction/summary') {
+      const usage = event.data.usage
+      store.upsertExtra({
+        workspace: workspaceOf(session),
+        sessionId: session.id,
+        kind: 'compaction',
+        turn: null,
+        provider: event.data.provider,
+        model: event.data.model,
+        uncachedInputTokens: usage?.inputTokens ?? 0,
+        outputTokens: usage?.outputTokens ?? 0,
+        cacheReadTokens: usage?.cacheReadTokens ?? 0,
+        cacheWriteTokens: usage?.cacheWriteTokens ?? 0,
+        reasoningTokens: usage?.reasoningTokens ?? 0,
+        requestCount: 1,
+        eventTime: event.time,
+        sourceSeq: event.seq,
+      })
+      return
+    }
+
+    if (event.type === 'web/deepseek-search-llm-request') {
+      store.upsertExtra({
+        workspace: workspaceOf(session),
+        sessionId: session.id,
+        kind: 'web-search',
+        turn: null,
+        provider: 'deepseek-official',
+        model: event.data.body.model,
+        uncachedInputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        requestCount: 1,
+        eventTime: event.time,
+        sourceSeq: event.seq,
+      })
+      if (settings.get().captureWebSearchUsage) {
+        const key = JSON.stringify(event.data.body)
+        const queue = pendingWebSearches.get(key) ?? []
+        queue.push({
+          session,
+          sourceSeq: event.seq,
+          model: event.data.body.model,
+        })
+        pendingWebSearches.set(key, queue)
+      }
+      return
+    }
+
     if (event.type === 'turn/end') {
       if (flushTurn(session, event.data.turn) && stats !== undefined) {
         stats.writtenTurns += 1
@@ -587,15 +800,23 @@ export function apply(ctx: PluginContext, config: Config): void {
   }
 
   if (config.backfillOnStart) {
-    for (const session of ctx.sessions.list()) processSession(session)
+    for (const session of ctx.sessions.list()) {
+      processSession(session)
+      // Persist any currently-open turns so live usage is visible even
+      // before the turn ends or the session is disposed.
+      persistOpenTurns(session)
+    }
   }
 
   ctx.on('session/created', (session) => {
     processSession(session)
+    persistOpenTurns(session)
   })
 
   ctx.on('session/event', (session, event) => {
     processEvent(session, event)
+    // Keep in-progress turns visible in /api/usage after each completed step.
+    if (event.type === 'step/end') persistOpenTurns(session)
   })
 
   ctx.on('session/disposed', (session) => {
@@ -603,6 +824,143 @@ export function apply(ctx: PluginContext, config: Config): void {
     routeBySession.delete(session)
     metaBySession.delete(session)
   })
+
+  // Session-title generation goes through ctx.llm.stream() but does not
+  // persist its usage into the session log; capture it at the LLM seam so the
+  // auxiliary title request is still counted.
+  ctx.on('llm/stream', (options, next): AsyncIterable<StreamChunk> => {
+    if (options.purpose !== 'session-title' || options.sessionId === undefined) return next()
+    const session = ctx.sessions.get(options.sessionId)
+    if (session === undefined) return next()
+
+    let usage: TokenUsage | undefined
+    const stream = next()
+    return (async function* () {
+      try {
+        for await (const chunk of stream) {
+          if (chunk.type === 'usage') usage = chunk.usage
+          yield chunk
+        }
+      } finally {
+        store.upsertExtra({
+          workspace: workspaceOf(session),
+          sessionId: session.id,
+          kind: 'session-title',
+          turn: null,
+          provider: options.provider,
+          model: options.model,
+          uncachedInputTokens: usage?.inputTokens ?? 0,
+          outputTokens: usage?.outputTokens ?? 0,
+          cacheReadTokens: usage?.cacheReadTokens ?? 0,
+          cacheWriteTokens: usage?.cacheWriteTokens ?? 0,
+          reasoningTokens: usage?.reasoningTokens ?? 0,
+          requestCount: 1,
+          eventTime: Date.now(),
+          sourceSeq: null,
+        })
+      }
+    })()
+  })
+
+  // Optional runtime capture of DeepSeek web-search response usage. This is a
+  // fetch interceptor rather than a DSH source patch: it lets the plugin parse
+  // Anthropic usage from the search provider's HTTP response without changing
+  // the web-search-deepseek package.
+  ctx.effect(() => {
+    let originalFetch: typeof globalThis.fetch | undefined
+    let wrappedFetch: typeof globalThis.fetch | undefined
+    let installed = false
+
+    const uninstall = (): void => {
+      if (installed && originalFetch && globalThis.fetch === wrappedFetch) {
+        globalThis.fetch = originalFetch
+      }
+      installed = false
+      originalFetch = undefined
+      wrappedFetch = undefined
+      pendingWebSearches.clear()
+    }
+
+    const install = (): void => {
+      if (installed) return
+      originalFetch = globalThis.fetch
+      if (originalFetch === undefined) return
+      wrappedFetch = async (input, init) => {
+        const url = typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url
+        const method = (init?.method
+          ?? (typeof input !== 'string' && 'method' in input ? input.method : 'GET')
+        )?.toUpperCase()
+        let matched: { session: SessionLike; sourceSeq: number; model: string } | undefined
+        if (method === 'POST' && url.includes('/messages')) {
+          const bodyText = typeof init?.body === 'string' ? init.body : undefined
+          if (bodyText) {
+            const queue = pendingWebSearches.get(bodyText)
+            matched = queue?.shift()
+            if (queue !== undefined && queue.length === 0) pendingWebSearches.delete(bodyText)
+          }
+        }
+        try {
+          const response = await originalFetch!(input, init)
+          if (matched) {
+            const clone = response.clone()
+            try {
+              const data = await clone.json() as { usage?: {
+                input_tokens?: number
+                output_tokens?: number
+                cache_read_input_tokens?: number
+                cache_creation_input_tokens?: number
+              } }
+              const usage = data.usage
+              if (usage) {
+                const cacheRead = usage.cache_read_input_tokens ?? 0
+                const cacheWrite = usage.cache_creation_input_tokens ?? 0
+                const inputTokens = Math.max(0, (usage.input_tokens ?? 0) - cacheRead - cacheWrite)
+                store.upsertExtra({
+                  workspace: workspaceOf(matched.session),
+                  sessionId: matched.session.id,
+                  kind: 'web-search',
+                  turn: null,
+                  provider: 'deepseek-official',
+                  model: matched.model,
+                  uncachedInputTokens: inputTokens,
+                  outputTokens: usage.output_tokens ?? 0,
+                  cacheReadTokens: cacheRead,
+                  cacheWriteTokens: cacheWrite,
+                  reasoningTokens: 0,
+                  requestCount: 1,
+                  eventTime: Date.now(),
+                  sourceSeq: matched.sourceSeq,
+                })
+              }
+            } catch {
+              // Response parsing failure is non-fatal; keep the zero-token row.
+            }
+          }
+          return response
+        } catch (error) {
+          throw error
+        }
+      }
+      globalThis.fetch = wrappedFetch
+      installed = true
+    }
+
+    const mount = (): void => {
+      uninstall()
+      if (settings.get().captureWebSearchUsage) install()
+    }
+
+    mount()
+    const disposeWatcher = settings.watch(() => mount())
+    return () => {
+      disposeWatcher()
+      uninstall()
+    }
+  }, 'dsh-token-sql: web search usage capture')
 
   // POST /dsh-token-sql/api/scan — full scan of every persisted session.
   ctx.effect(() => ctx.webServer.register({
@@ -658,6 +1016,20 @@ export function apply(ctx: PluginContext, config: Config): void {
             const url = new URL(req.url ?? '/', 'http://dsh.internal')
             const raw = url.searchParams.get('raw') === '1'
               || url.searchParams.get('raw') === 'true'
+            const legacy = url.searchParams.get('legacy') === '1'
+              || url.searchParams.get('legacy') === 'true'
+            const includeExtra = url.searchParams.get('include_extra') === '1'
+              || url.searchParams.get('include_extra') === 'true'
+              || url.searchParams.get('includeExtra') === '1'
+              || url.searchParams.get('includeExtra') === 'true'
+            const kind = url.searchParams.get('kind') ?? undefined
+            const groupBy = url.searchParams.get('group_by') ?? url.searchParams.get('groupBy') ?? undefined
+            if (groupBy !== undefined
+              && groupBy !== 'model' && groupBy !== 'session'
+              && groupBy !== 'day' && groupBy !== 'kind' && groupBy !== 'workspace') {
+              writeError(res, 400, `invalid "group_by": expected model, session, day, kind, or workspace`)
+              return
+            }
 
             const parsed = parseUsageQuery(url)
             if ('error' in parsed) {
@@ -665,16 +1037,112 @@ export function apply(ctx: PluginContext, config: Config): void {
               return
             }
             const { query } = parsed
+            const { limit, offset, ...baseQuery } = query
 
-            const rows = store.listTurns(query)
-            if (raw) {
-              writeJson(res, 200, rows)
+            const rows = store.listTurns(baseQuery)
+            const extraRows = store.listExtra(baseQuery)
+            const mainTotals = store.getTotals(baseQuery)
+            const extraTotals = store.getExtraTotals(baseQuery)
+            const mergedTotals = {
+              uncachedInputTokens: mainTotals.uncachedInputTokens + extraTotals.uncachedInputTokens,
+              outputTokens: mainTotals.outputTokens + extraTotals.outputTokens,
+              cacheReadTokens: mainTotals.cacheReadTokens + extraTotals.cacheReadTokens,
+              cacheWriteTokens: mainTotals.cacheWriteTokens + extraTotals.cacheWriteTokens,
+              reasoningTokens: mainTotals.reasoningTokens + extraTotals.reasoningTokens,
+              requestCount: mainTotals.requestCount + extraTotals.requestCount,
+              turnCount: mainTotals.turnCount,
+              sessionCount: mainTotals.sessionCount + extraTotals.sessionCount,
+              workspaceCount: mainTotals.workspaceCount + extraTotals.workspaceCount,
+            }
+
+            if (legacy) {
+              if (raw) {
+                if (includeExtra) {
+                  writeJson(res, 200, { rows, extraRows })
+                } else {
+                  writeJson(res, 200, rows)
+                }
+                return
+              }
+              writeOk(res, {
+                rows,
+                ...(includeExtra ? { extraRows } : {}),
+                totals: mergedTotals,
+              })
               return
             }
-            writeOk(res, {
-              rows,
-              totals: store.getTotals(query),
-            })
+
+            const records: UnifiedUsageRecord[] = [
+              ...rows.map((row): UnifiedUsageRecord => ({
+                kind: 'session',
+                workspace: row.workspace,
+                sessionId: row.sessionId,
+                turn: row.turn,
+                provider: row.provider,
+                model: row.model,
+                uncachedInputTokens: row.uncachedInputTokens,
+                outputTokens: row.outputTokens,
+                cacheReadTokens: row.cacheReadTokens,
+                cacheWriteTokens: row.cacheWriteTokens,
+                reasoningTokens: row.reasoningTokens,
+                requestCount: row.requestCount,
+                eventTime: row.lastEventTime,
+                sourceSeq: null,
+                sessionTitle: row.sessionTitle,
+                sessionCreatedAt: row.sessionCreatedAt,
+                sessionUpdatedAt: row.sessionUpdatedAt,
+                firstEventTime: row.firstEventTime,
+                lastEventTime: row.lastEventTime,
+              })),
+              ...extraRows.map((row): UnifiedUsageRecord => ({
+                kind: row.kind,
+                workspace: row.workspace,
+                sessionId: row.sessionId,
+                turn: row.turn,
+                provider: row.provider,
+                model: row.model,
+                uncachedInputTokens: row.uncachedInputTokens,
+                outputTokens: row.outputTokens,
+                cacheReadTokens: row.cacheReadTokens,
+                cacheWriteTokens: row.cacheWriteTokens,
+                reasoningTokens: row.reasoningTokens,
+                requestCount: row.requestCount,
+                eventTime: row.eventTime,
+                sourceSeq: row.sourceSeq,
+                sessionTitle: null,
+                sessionCreatedAt: null,
+                sessionUpdatedAt: null,
+                firstEventTime: null,
+                lastEventTime: null,
+              })),
+            ]
+
+            const filtered = kind === undefined
+              ? records
+              : records.filter(record => record.kind === kind)
+            filtered.sort((a, b) => a.eventTime - b.eventTime || a.sessionId.localeCompare(b.sessionId))
+
+            const totals = totalsFromRecords(filtered)
+            const start = offset ?? 0
+            const paged = limit === undefined
+              ? filtered.slice(start)
+              : filtered.slice(start, start + limit)
+
+            if (groupBy !== undefined) {
+              const groups = groupsFromRecords(filtered, groupBy)
+              if (raw) {
+                writeJson(res, 200, groups)
+              } else {
+                writeOk(res, { groups, totals })
+              }
+              return
+            }
+
+            if (raw) {
+              writeJson(res, 200, paged)
+              return
+            }
+            writeOk(res, { records: paged, totals })
           } catch (error) {
             writeError(res, 500, error)
           }

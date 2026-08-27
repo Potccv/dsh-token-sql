@@ -91,6 +91,7 @@ export function TokenSqlSettingsCard(_props: Props) {
   const [scanning, setScanning] = useState(false)
   const [message, setMessage] = useState<string | undefined>(undefined)
   const [draftExposeWebApi, setDraftExposeWebApi] = useState<boolean | undefined>(undefined)
+  const [draftCaptureWebSearchUsage, setDraftCaptureWebSearchUsage] = useState<boolean | undefined>(undefined)
   const [saving, setSaving] = useState(false)
   const [failed, setFailed] = useState(false)
 
@@ -98,7 +99,10 @@ export function TokenSqlSettingsCard(_props: Props) {
   const config = snapshot.status === 'ready' ? snapshot.value : undefined
   const currentExposeWebApi = config?.exposeWebApi ?? true
   const exposeWebApi = draftExposeWebApi ?? currentExposeWebApi
-  const dirty = draftExposeWebApi !== undefined && draftExposeWebApi !== currentExposeWebApi
+  const currentCaptureWebSearchUsage = config?.captureWebSearchUsage ?? false
+  const captureWebSearchUsage = draftCaptureWebSearchUsage ?? currentCaptureWebSearchUsage
+  const dirty = (draftExposeWebApi !== undefined && draftExposeWebApi !== currentExposeWebApi)
+    || (draftCaptureWebSearchUsage !== undefined && draftCaptureWebSearchUsage !== currentCaptureWebSearchUsage)
   const writable = snapshot.status === 'ready' && snapshot.writable
 
   const state: CardShell = {
@@ -110,21 +114,36 @@ export function TokenSqlSettingsCard(_props: Props) {
     failed,
   }
 
-  const handleToggle = (): void => {
+  const handleToggleExpose = (): void => {
     setDraftExposeWebApi(!exposeWebApi)
     setFailed(false)
   }
 
+  const handleToggleCapture = (): void => {
+    setDraftCaptureWebSearchUsage(!captureWebSearchUsage)
+    setFailed(false)
+  }
+
   const handleSave = async (): Promise<void> => {
-    if (draftExposeWebApi === undefined || saving) return
+    if ((draftExposeWebApi === undefined && draftCaptureWebSearchUsage === undefined) || saving) return
     setSaving(true)
     setFailed(false)
     try {
-      await tokenSqlScope().set('exposeWebApi', draftExposeWebApi)
+      if (draftExposeWebApi !== undefined) {
+        await tokenSqlScope().set('exposeWebApi', draftExposeWebApi)
+      }
+      if (draftCaptureWebSearchUsage !== undefined) {
+        await tokenSqlScope().set('captureWebSearchUsage', draftCaptureWebSearchUsage)
+      }
       const next = tokenSqlScope().getSnapshot()
       const user = next.user as Record<string, unknown> | undefined
-      const landed = next.status === 'ready' && user?.['exposeWebApi'] === draftExposeWebApi
-      if (landed) setDraftExposeWebApi(undefined)
+      const landed = next.status === 'ready'
+        && (draftExposeWebApi === undefined || user?.['exposeWebApi'] === draftExposeWebApi)
+        && (draftCaptureWebSearchUsage === undefined || user?.['captureWebSearchUsage'] === draftCaptureWebSearchUsage)
+      if (landed) {
+        setDraftExposeWebApi(undefined)
+        setDraftCaptureWebSearchUsage(undefined)
+      }
       setFailed(!landed)
     } catch {
       setFailed(true)
@@ -135,6 +154,7 @@ export function TokenSqlSettingsCard(_props: Props) {
 
   const handleDiscard = (): void => {
     setDraftExposeWebApi(undefined)
+    setDraftCaptureWebSearchUsage(undefined)
     setFailed(false)
   }
 
@@ -151,19 +171,19 @@ export function TokenSqlSettingsCard(_props: Props) {
     }
   }
 
-  const trackStyle: React.CSSProperties = {
+  const trackStyleFor = (active: boolean): React.CSSProperties => ({
     ...switchTrackStyle,
-    ...(exposeWebApi ? {
+    ...(active ? {
       background: 'var(--dsw-alias-state-business-primary)',
       borderColor: 'var(--dsw-alias-state-business-primary)',
     } : {}),
     ...(!writable || saving ? { opacity: 0.5, cursor: 'not-allowed' } : {}),
-  }
+  })
 
-  const thumbStyle: React.CSSProperties = {
+  const thumbStyleFor = (active: boolean): React.CSSProperties => ({
     ...switchThumbStyle,
-    ...(exposeWebApi ? { transform: 'translateX(16px)', background: '#fff' } : {}),
-  }
+    ...(active ? { transform: 'translateX(16px)', background: '#fff' } : {}),
+  })
 
   return (
     <PluginCard
@@ -181,11 +201,28 @@ export function TokenSqlSettingsCard(_props: Props) {
             style={switchInputStyle}
             checked={exposeWebApi}
             disabled={!writable || saving}
-            onChange={handleToggle}
+            onChange={handleToggleExpose}
             aria-label="网页 API 映射开关"
           />
-          <span style={trackStyle} aria-hidden="true">
-            <span style={thumbStyle} />
+          <span style={trackStyleFor(exposeWebApi)} aria-hidden="true">
+            <span style={thumbStyleFor(exposeWebApi)} />
+          </span>
+        </label>
+      </div>
+
+      <div style={switchRowStyle}>
+        <span style={switchLabelStyle}>捕获 Web 搜索 tokens（运行时注入 fetch 拦截）</span>
+        <label style={switchStyle}>
+          <input
+            type="checkbox"
+            style={switchInputStyle}
+            checked={captureWebSearchUsage}
+            disabled={!writable || saving}
+            onChange={handleToggleCapture}
+            aria-label="捕获 Web 搜索 tokens 开关"
+          />
+          <span style={trackStyleFor(captureWebSearchUsage)} aria-hidden="true">
+            <span style={thumbStyleFor(captureWebSearchUsage)} />
           </span>
         </label>
       </div>

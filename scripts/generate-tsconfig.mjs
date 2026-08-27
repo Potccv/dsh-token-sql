@@ -82,6 +82,8 @@ const paths = {
   '@deepseek-ai/dsh-host-webserver': [P('packages/host/webserver/lib/types/index.d.ts')],
   '@deepseek-ai/dsh-session-persistence': [P('packages/session/session-persistence/lib/types/index.d.ts')],
   '@deepseek-ai/dsh-session-title': [P('packages/session/session-title/lib/types/index.d.ts')],
+  '@deepseek-ai/dsh-compaction/types': [P('packages/compaction/compaction/lib/types/types.d.ts')],
+  '@deepseek-ai/dsh-web-search-deepseek': [P('packages/web/web-search-deepseek/lib/types/index.d.ts')],
   '@deepseek-ai/dsh-client-runtime/client': [P('packages/client/runtime/lib/types/client/index.d.ts')],
   '@deepseek-ai/dsh-client-ui-settings-plugins/client': [P('packages/client/ui-settings-plugins/lib/types/client/index.d.ts')],
   '@deepseek-ai/dsh-client-ui-slots': [P('packages/client/ui-slots/lib/types/index.d.ts')],

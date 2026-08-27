@@ -11,6 +11,7 @@ export interface TokenSqlClientConfig {
   path: string
   backfillOnStart: boolean
   exposeWebApi: boolean
+  captureWebSearchUsage: boolean
 }
 
 let scope: ClientSettingsScope<TokenSqlClientConfig> | undefined
