@@ -1,15 +1,17 @@
 # dsh-token-sql
 
-将 DeepSeek Harness 会话中产生的 token usage 按 **turn 聚合**后持久化到 SQLite 的 DSH 宿主插件。
+将 DeepSeek Harness 会话中产生的 token usage 持久化到 SQLite 的 DSH 宿主插件。主对话按 **turn 聚合**，compaction / session-title / web-search 等额外请求按独立记录保存。
 
 ## 功能
 
-- 只写入**真正产生过 token usage** 的会话/turn；没有 usage 的会话不会生成行。
-- 数据层级：`workspace -> session_id -> turn`。
-- 每个 turn 汇总该 turn 内所有 step 的 token usage，存为一行。
+- 主对话按 `workspace -> session_id -> turn` 聚合，每个 turn 汇总该 turn 内所有 step 的 token usage。
 - 同一 step 的 `assistant/chunk` usage 和 `assistant/message` usage 不会重复累计：`assistant/message` 作为该 step 的最终值覆盖早期 chunk 样本。
+- 没有 usage 的 step 也会按 `step/end` 计为一次请求，tokens 记为 0。
 - 支持启动时回填当前已加载会话的历史 usage。
 - 支持全量扫描所有持久化历史会话，并在 Settings > Plugins 中提供“全量扫描所有历史会话”按钮。
+- 支持统计 `compaction/summary`、`session-title`、`web-search` 等额外请求。
+- 支持通过设置开关“捕获 Web 搜索 tokens”，运行时解析 DeepSeek 搜索响应 usage，不修改 DSH 源码。
+- `/api/usage` 默认返回统一的 `records` + `totals`，同时包含主对话和额外请求。
 
 ## 安装
 
@@ -81,6 +83,7 @@ dsh --profile web --dump-config
     path: ''
     backfillOnStart: true
     exposeWebApi: true
+    captureWebSearchUsage: false
 ```
 
 确认后重启对应 profile（如 `dsh web`），即可在宿主 Web 服务上访问：
@@ -150,6 +153,31 @@ CREATE TABLE turn_token_usage (
 );
 ```
 
+额外请求（compaction / session-title / web-search）保存在 `extra_usage` 表：
+
+```sql
+CREATE TABLE extra_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  turn INTEGER,
+  provider TEXT,
+  model TEXT,
+  uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  request_count INTEGER NOT NULL DEFAULT 1,
+  event_time INTEGER NOT NULL,
+  source_seq INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(workspace, session_id, kind, source_seq)
+);
+```
+
 其中：
 
 - `workspace` 来自会话 `cwd` 的目录名，例如 `/root/DSHWorkFile/dsh-token-meter` → `dsh-token-meter`
@@ -158,8 +186,10 @@ CREATE TABLE turn_token_usage (
 - `session_title` 是会话标题（来自 `session/title` 事件，last-wins）
 - `session_created_at` 是会话创建时间（来自 `session.header.createdAt`）
 - `session_updated_at` 是会话最后活动时间（处理到的最新事件时间）
-- `request_count` 是该 turn 内上报过 usage 的 step 数量
+- `request_count` 是该 turn 内的 step 数量；没有 usage 的 step 也会计为 1 次请求，tokens 为 0
 - `reasoning_tokens` 已包含在 `output_tokens` 中，这里单独保存便于查看推理细分
+- `extra_usage.kind` 取值：`compaction` / `session-title` / `web-search`
+- `extra_usage.source_seq` 用于关联 session 事件 seq，避免全量扫描重复写入
 
 ## 配置
 
@@ -167,12 +197,16 @@ CREATE TABLE turn_token_usage (
 - id: dsh-token-sql
   name: 'dsh-token-sql'
   config:
-    path: ''              # 空字符串 = 默认 ~/.dsh/storages/token-usage.sqlite
-    backfillOnStart: true # 启动时回填当前已加载会话
-    exposeWebApi: true    # 是否在 Harness Web 服务上暴露 /api/usage
+    path: ''                    # 空字符串 = 默认 ~/.dsh/storages/token-usage.sqlite
+    backfillOnStart: true       # 启动时回填当前已加载会话
+    exposeWebApi: true          # 是否在 Harness Web 服务上暴露 /api/usage
+    captureWebSearchUsage: false # 是否运行时注入 fetch 拦截，解析 Web 搜索响应 usage
 ```
 
-也可以在 **设置 → 插件 → Token SQL** 里通过“网页 API 映射”开关实时切换 `exposeWebApi`。
+也可以在 **设置 → 插件 → Token SQL** 里实时切换：
+
+- “网页 API 映射”开关：`exposeWebApi`
+- “捕获 Web 搜索 tokens”开关：`captureWebSearchUsage`
 
 ## 全量扫描
 
@@ -199,142 +233,177 @@ CREATE TABLE turn_token_usage (
 
 ## 读取 API
 
-宿主 Web 服务（默认 `127.0.0.1:3080`）上暴露了一个只读接口：
+宿主 Web 服务（默认 `127.0.0.1:3080`）暴露了一个只读接口：
 
 ```text
 GET /api/usage
 ```
 
-返回 SQLite 中 `turn_token_usage` 表的全部行，以及一个聚合汇总：
+默认返回**统一记录 `records` + 汇总 `totals`**，同时包含 `turn_token_usage` 和 `extra_usage` 两张表的数据。
+
+### 默认响应示例
 
 ```json
 {
   "ok": true,
   "value": {
-    "rows": [
+    "records": [
       {
+        "kind": "session",
         "workspace": "dsh-token-meter",
         "sessionId": "session-xxx",
         "turn": 1,
-        "sessionTitle": null,
-        "sessionCreatedAt": 1787397701893,
-        "sessionUpdatedAt": 1787397701899,
-        "provider": "deepseek",
-        "model": "deepseek-chat",
+        "provider": "deepseek-official",
+        "model": "deepseek-v4-flash",
         "uncachedInputTokens": 65,
         "outputTokens": 154,
         "cacheReadTokens": 1664,
         "cacheWriteTokens": 0,
         "reasoningTokens": 61,
         "requestCount": 1,
+        "eventTime": 1787397701899,
+        "sourceSeq": null,
+        "sessionTitle": null,
+        "sessionCreatedAt": 1787397701893,
+        "sessionUpdatedAt": 1787397701899,
         "firstEventTime": 1787397701899,
         "lastEventTime": 1787397701899
+      },
+      {
+        "kind": "web-search",
+        "workspace": "dsh-token-meter",
+        "sessionId": "session-xxx",
+        "turn": null,
+        "provider": "deepseek-official",
+        "model": "deepseek-v4-flash",
+        "uncachedInputTokens": 8434,
+        "outputTokens": 801,
+        "cacheReadTokens": 640,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "requestCount": 1,
+        "eventTime": 1787774182605,
+        "sourceSeq": 63738,
+        "sessionTitle": null,
+        "sessionCreatedAt": null,
+        "sessionUpdatedAt": null,
+        "firstEventTime": null,
+        "lastEventTime": null
       }
     ],
     "totals": {
-      "uncachedInputTokens": 65,
-      "outputTokens": 154,
-      "cacheReadTokens": 1664,
+      "uncachedInputTokens": 10960511,
+      "outputTokens": 5792598,
+      "cacheReadTokens": 2877045888,
       "cacheWriteTokens": 0,
-      "reasoningTokens": 61,
-      "requestCount": 1,
-      "turnCount": 1,
-      "sessionCount": 1,
-      "workspaceCount": 1
+      "reasoningTokens": 2740565,
+      "requestCount": 11373,
+      "recordCount": 1114,
+      "turnCount": 437,
+      "sessionCount": 83,
+      "workspaceCount": 12
     }
   }
 }
 ```
 
+`kind` 取值：
+
+- `session`：主对话 turn 聚合
+- `compaction`：压缩摘要请求
+- `session-title`：标题生成请求
+- `web-search`：DeepSeek 搜索请求
+
 该接口与全量扫描一样有 loopback fence，只接受来自本机（`127.0.0.1` / `localhost`）的 GET 请求。
 
-### 查询参数
+### 兼容旧结构
 
-`turn_token_usage` 表里的字段基本都可以作为过滤参数。推荐使用 SQL 列名的 snake_case 形式，也兼容 camelCase 别名。
-
-文本/可空字段精确匹配：
-
-| 参数 | 对应列 |
-| --- | --- |
-| `workspace` | `workspace` |
-| `session_id` / `sessionId` | `session_id` |
-| `session_title` / `sessionTitle` | `session_title` |
-| `provider` | `provider` |
-| `model` | `model` |
-
-数字字段精确匹配：
-
-| 参数 | 对应列 |
-| --- | --- |
-| `id` | `id` |
-| `turn` | `turn` |
-| `session_created_at` / `sessionCreatedAt` | `session_created_at` |
-| `session_updated_at` / `sessionUpdatedAt` | `session_updated_at` |
-| `uncached_input_tokens` / `uncachedInputTokens` | `uncached_input_tokens` |
-| `output_tokens` / `outputTokens` | `output_tokens` |
-| `cache_read_tokens` / `cacheReadTokens` | `cache_read_tokens` |
-| `cache_write_tokens` / `cacheWriteTokens` | `cache_write_tokens` |
-| `reasoning_tokens` / `reasoningTokens` | `reasoning_tokens` |
-| `request_count` / `requestCount` | `request_count` |
-| `first_event_time` / `firstEventTime` | `first_event_time` |
-| `last_event_time` / `lastEventTime` | `last_event_time` |
-| `created_at` / `createdAt` | `created_at`（行创建时间） |
-| `updated_at` / `updatedAt` | `updated_at`（行更新时间） |
-
-数字字段还支持范围过滤，使用 `_min` / `_max` 后缀（含边界）：
+如果你仍然需要旧的 `rows` / `extraRows` 结构，可以加 `legacy=1`：
 
 ```text
-turn_min=1&turn_max=5
-output_tokens_min=1000
-cache_read_tokens_max=500000
+GET /api/usage?legacy=1&include_extra=1
 ```
 
-对应的 camelCase 也兼容，例如 `turnMin` / `turnMax`、`outputTokensMin`。
-
-### 时间段快捷筛选
-
-除了直接写 `last_event_time_min` / `last_event_time_max`，还提供更友好的时间范围参数：
+### 统一记录过滤
 
 | 参数 | 说明 |
 | --- | --- |
-| `since` / `from` | 起始时间；支持毫秒时间戳、ISO 日期、`now`、相对时长如 `7d` / `24h` / `1w` |
-| `until` / `to` | 结束时间；支持毫秒时间戳、ISO 日期、`now` |
-| `time_field` / `timeField` | 选择按哪个时间字段过滤，默认 `last_event_time`；可选 `first_event_time`、`session_created_at`、`session_updated_at`、`created_at`、`updated_at` |
+| `kind` | 按记录类型过滤：`session` / `compaction` / `session-title` / `web-search` |
+| `workspace` | 按 workspace 过滤 |
+| `session_id` / `sessionId` | 按 session 过滤 |
+| `provider` | 按 provider 过滤 |
+| `model` | 按 model 过滤 |
+| `turn` | 按 turn 过滤（主对话） |
+| `since` / `until` | 按时间范围过滤 |
+| `time_field` / `timeField` | 选择时间字段，默认 `last_event_time` |
 
 示例：
 
 ```text
-# 过去一周（默认按 last_event_time）
+# 只看主对话
+GET /api/usage?kind=session
+
+# 只看 web-search
+GET /api/usage?kind=web-search
+
+# 只看某个模型
+GET /api/usage?model=deepseek-v4-flash
+
+# 过去 7 天
 GET /api/usage?since=7d
-
-# 指定起止时间
-GET /api/usage?since=2025-01-01&until=2025-01-08
-
-# 按会话创建时间筛选过去一周
-GET /api/usage?since=7d&time_field=session_created_at
-
-# 过去 24 小时且只取原始数组
-GET /api/usage?since=24h&raw=1
 ```
 
-分页与输出：
+### 服务端分组
+
+支持 `group_by`，让工具直接拿分组汇总：
+
+```text
+GET /api/usage?group_by=model
+GET /api/usage?group_by=session
+GET /api/usage?group_by=day
+GET /api/usage?group_by=kind
+GET /api/usage?group_by=workspace
+```
+
+示例响应：
+
+```json
+{
+  "ok": true,
+  "value": {
+    "groups": [
+      {
+        "key": {
+          "provider": "deepseek-official",
+          "model": "deepseek-v4-flash"
+        },
+        "uncachedInputTokens": 1000000,
+        "outputTokens": 500000,
+        "cacheReadTokens": 8000000,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 200000,
+        "requestCount": 5000,
+        "recordCount": 5000,
+        "sessionCount": 30
+      }
+    ],
+    "totals": {
+      "...": "..."
+    }
+  }
+}
+```
+
+### 分页与输出
 
 | 参数 | 说明 |
 | --- | --- |
-| `limit` | 返回行数上限（非负整数） |
-| `offset` | 跳过前面的行数（非负整数，常与 `limit` 一起分页） |
-| `raw=1` / `raw=true` | 直接返回裸 JSON 行数组，不包 `{ ok, value }`，也没有 `totals` |
+| `limit` | 返回记录数上限（非负整数） |
+| `offset` | 跳过前面的记录数（非负整数） |
+| `raw=1` / `raw=true` | 直接返回裸 `records` 数组，不包 `{ ok, value }` |
+| `legacy=1` / `legacy=true` | 使用旧结构 `rows` / `extraRows` |
 
-示例：
-
-```text
-GET /api/usage?workspace=dsh-token-meter&limit=10&offset=20
-GET /api/usage?session_id=session-xxx&raw=1
-GET /api/usage?provider=deepseek-official&output_tokens_min=1000&limit=50
-GET /api/usage?turn_min=1&turn_max=3&cache_read_tokens_max=100000
-```
-
-`totals` 会跟随所有过滤条件一起汇总（`limit` / `offset` 除外，它们只影响 `rows`）。
+`totals` 会跟随所有过滤条件一起汇总；`limit` / `offset` 只影响返回的记录列表。
 
 ## 构建
 
@@ -352,5 +421,7 @@ DSH_CHECKOUT=/root/deepseek-harness npm run build
 ## 说明
 
 - 本项目包含 host 端（SQLite 写入/全量扫描路由）和 client 端（Settings > Plugins 按钮）。
-- 当前只处理 `assistant/chunk` 和 `assistant/message` 中的 usage；`compaction/summary` 等其它 usage 暂未纳入。
-- 写入时机：turn 结束时写入该 turn 的汇总行；如果会话在 turn 未结束时被销毁，也会 flush 已累积的 turn。
+- 主对话 usage 来自 `assistant/chunk` / `assistant/message`；额外请求来自 `compaction/summary`、`session-title`、`web-search`。
+- `captureWebSearchUsage` 开启时，插件会运行时拦截 DeepSeek 搜索响应并解析 usage；这是 monkey-patch 方案，不修改 DSH 源码。
+- 历史 `session-title` 请求没有持久化 usage，无法回补；新产生的标题请求会通过 `llm/stream` 捕获。
+- 写入时机：turn 结束时写入该 turn 的汇总行；未结束 turn 也会在 `step/end` / 全量扫描时落库。
