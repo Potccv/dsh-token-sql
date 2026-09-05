@@ -24,7 +24,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { basename } from 'node:path'
-import { settingsNamespace, type SettingsProvider } from '@deepseek-ai/dsh-settings'
+import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import type { Session, SessionEvent, SessionHeader, SessionStore } from '@deepseek-ai/dsh-session'
@@ -38,7 +38,7 @@ import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { openTokenUsageStore, type ExtraUsageKind, type TokenUsageStore, type TurnQueryOptions, type UsageTotals } from './db.ts'
 
 export const name = 'dsh-token-sql'
-export const SETTINGS_NS = settingsNamespace('dsh-token-sql')
+export const SETTINGS_NS = 'dsh-token-sql'
 
 /** Host services this plugin consumes directly at apply time. */
 export const inject = ['settings', 'webServer', 'sessions', 'sessionPersistence']
