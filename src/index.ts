@@ -1,32 +1,29 @@
 /**
- * dsh-token-sql: persist DeepSeek Harness token usage into SQLite,
- * aggregated per turn.
+ * dsh-token-sql: persist individual DeepSeek Harness token-usage requests
+ * into SQLite.
  *
- * Only turns that actually reported provider usage produce a row.
- * The database hierarchy is:
- *
- *   workspace -> session_id -> turn
- *
- * For each turn, token usage from every step is summed into one row.
- * `assistant/chunk` provides an early per-step sample; `assistant/message`
- * is authoritative for the same step and replaces the chunk sample, so a
- * step is never double counted.
+ * Main conversation requests are identified by session + turn + step.
+ * Compaction and web-search requests are identified by their persisted
+ * session event seq. Session-title calls are live-only independent rows.
  *
  * The plugin also exposes:
  * - startup backfill of currently loaded sessions
  * - a host HTTP route `POST /dsh-token-sql/api/scan` to run a full scan of
  *   all persisted sessions (the Settings > Plugins button calls this)
  * - a host HTTP route `GET /api/usage` to read the SQLite usage data back
+ * - a host HTTP route `GET /api/usage/schema` to describe that data source
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename } from 'node:path'
+import { zstdDecompressSync } from 'node:zlib'
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
-import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import type { SessionHandle, SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import type { Session, SessionEvent, SessionHeader, SessionStore } from '@deepseek-ai/dsh-session'
 // Type-only: merges the `session/title` SessionEventMap variant.
 import type {} from '@deepseek-ai/dsh-session-title'
@@ -35,10 +32,70 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-compaction/types'
 import type {} from '@deepseek-ai/dsh-web-search-deepseek'
 import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
-import { openTokenUsageStore, type ExtraUsageKind, type TokenUsageStore, type TurnQueryOptions, type UsageTotals } from './db.ts'
+import {
+  openTokenUsageStore,
+  TOKEN_USAGE_SCHEMA_VERSION,
+  type TokenUsageRow,
+  type TokenUsageStore,
+  type UsageQueryOptions,
+  type UsageTotals,
+} from './db.ts'
 
 export const name = 'dsh-token-sql'
 export const SETTINGS_NS = 'dsh-token-sql'
+
+const USAGE_HTTP_SCHEMA = {
+  schemaVersion: TOKEN_USAGE_SCHEMA_VERSION,
+  source: 'DeepSeek Harness token usage',
+  table: 'token_usage',
+  timeUnit: 'Unix milliseconds',
+  primaryKey: {
+    columns: ['id'],
+    autoincrement: true,
+  },
+  businessUniqueKeys: [
+    {
+      columns: ['session_id', 'turn', 'step'],
+      appliesWhen: "kind = 'session'",
+    },
+    {
+      columns: ['session_id', 'kind', 'source_seq'],
+      appliesWhen: "kind IN ('compaction', 'web-search')",
+    },
+  ],
+  defaultOrder: [
+    { column: 'event_time', direction: 'ASC' },
+    { column: 'id', direction: 'ASC' },
+  ],
+  enums: {
+    kind: ['session', 'compaction', 'session-title', 'web-search'],
+    usage_status: ['pending', 'captured', 'missing', 'failed'],
+  },
+  columns: [
+    { name: 'id', jsonName: 'id', sqliteType: 'INTEGER', nullable: false, description: '自增主键和入库顺序' },
+    { name: 'workspace', jsonName: 'workspace', sqliteType: 'TEXT', nullable: false, description: '会话 cwd 的目录名' },
+    { name: 'session_id', jsonName: 'sessionId', sqliteType: 'TEXT', nullable: false, description: 'DSH 会话 ID' },
+    { name: 'session_title', jsonName: 'sessionTitle', sqliteType: 'TEXT', nullable: true, description: '会话最新标题' },
+    { name: 'kind', jsonName: 'kind', sqliteType: 'TEXT', nullable: false, description: '请求类型' },
+    { name: 'turn', jsonName: 'turn', sqliteType: 'INTEGER', nullable: true, description: '主对话轮次；额外请求为空' },
+    { name: 'step', jsonName: 'step', sqliteType: 'INTEGER', nullable: true, description: 'turn 内的模型请求序号；额外请求为空' },
+    { name: 'source_seq', jsonName: 'sourceSeq', sqliteType: 'INTEGER', nullable: true, description: '对应的 DSH session 事件序号' },
+    { name: 'provider', jsonName: 'provider', sqliteType: 'TEXT', nullable: true, description: '模型供应商' },
+    { name: 'model', jsonName: 'model', sqliteType: 'TEXT', nullable: true, description: '模型名称' },
+    { name: 'usage_status', jsonName: 'usageStatus', sqliteType: 'TEXT', nullable: false, description: 'Token usage 获取状态' },
+    { name: 'uncached_input_tokens', jsonName: 'uncachedInputTokens', sqliteType: 'INTEGER', nullable: true, description: '未缓存输入 Token' },
+    { name: 'cache_read_tokens', jsonName: 'cacheReadTokens', sqliteType: 'INTEGER', nullable: true, description: '缓存读取 Token' },
+    { name: 'cache_write_tokens', jsonName: 'cacheWriteTokens', sqliteType: 'INTEGER', nullable: true, description: '缓存写入 Token' },
+    { name: 'output_tokens', jsonName: 'outputTokens', sqliteType: 'INTEGER', nullable: true, description: '输出 Token' },
+    { name: 'reasoning_tokens', jsonName: 'reasoningTokens', sqliteType: 'INTEGER', nullable: true, description: '输出中的推理 Token' },
+    { name: 'session_created_at', jsonName: 'sessionCreatedAt', sqliteType: 'INTEGER', nullable: false, description: '会话创建时间' },
+    { name: 'session_updated_at', jsonName: 'sessionUpdatedAt', sqliteType: 'INTEGER', nullable: false, description: '会话最后活动时间' },
+    { name: 'event_time', jsonName: 'eventTime', sqliteType: 'INTEGER', nullable: false, description: '请求对应的 DSH 事件时间' },
+    { name: 'usage_captured_at', jsonName: 'usageCapturedAt', sqliteType: 'INTEGER', nullable: true, description: '实际取得 usage 的时间' },
+    { name: 'created_at', jsonName: 'createdAt', sqliteType: 'INTEGER', nullable: false, description: '记录首次入库时间' },
+    { name: 'updated_at', jsonName: 'updatedAt', sqliteType: 'INTEGER', nullable: false, description: '记录最后更新时间' },
+  ],
+} as const
 
 /** Host services this plugin consumes directly at apply time. */
 export const inject = ['settings', 'webServer', 'sessions', 'sessionPersistence']
@@ -77,38 +134,8 @@ export interface PluginContext extends Context {
 interface SessionLike {
   id: string
   header: SessionHeader
-  events: readonly SessionEvent[]
-}
-
-/** One step's authoritative usage sample while a turn is being accumulated. */
-interface StepUsage {
-  usage: TokenUsage
-  provider: string | null
-  model: string | null
-  time: number
-}
-
-/** Unified usage record returned by the default /api/usage view. */
-interface UnifiedUsageRecord {
-  kind: 'session' | ExtraUsageKind
-  workspace: string
-  sessionId: string
-  turn: number | null
-  provider: string | null
-  model: string | null
-  uncachedInputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheWriteTokens: number
-  reasoningTokens: number
-  requestCount: number
-  eventTime: number
-  sourceSeq: number | null
-  sessionTitle: string | null
-  sessionCreatedAt: number | null
-  sessionUpdatedAt: number | null
-  firstEventTime: number | null
-  lastEventTime: number | null
+  events?: readonly SessionEvent[]
+  snapshotEvents?: () => readonly SessionEvent[]
 }
 
 /** Per-session metadata tracked while folding events. */
@@ -117,9 +144,6 @@ interface SessionMeta {
   createdAt: number
   updatedAt: number
 }
-
-/** Per-session accumulator: turn -> step -> usage sample. */
-type SessionTurnAccumulator = Map<number, Map<number, StepUsage>>
 
 function defaultDatabasePath(): string {
   if (process.env.DSH_HOME) return `${process.env.DSH_HOME}/storages/token-usage.sqlite`
@@ -135,54 +159,100 @@ function workspaceOf(session: SessionLike): string {
   return cwd === undefined || cwd === '' ? '_no-cwd' : basename(cwd)
 }
 
-function aggregateStepUsages(steps: Map<number, StepUsage>): {
-  uncachedInputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheWriteTokens: number
-  reasoningTokens: number
-  requestCount: number
-  firstEventTime: number
-  lastEventTime: number
-  provider: string | null
-  model: string | null
-} {
-  let uncachedInputTokens = 0
-  let outputTokens = 0
-  let cacheReadTokens = 0
-  let cacheWriteTokens = 0
-  let reasoningTokens = 0
-  let requestCount = 0
-  let firstEventTime = 0
-  let lastEventTime = 0
-  let provider: string | null = null
-  let model: string | null = null
+/** Locate each complete frame in the JSONL backend's concatenated Zstandard file. */
+function zstdFrameRanges(buffer: Buffer): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = []
+  let offset = 0
+  while (offset < buffer.length) {
+    const start = offset
+    if (buffer.length - offset < 5 || buffer.readUInt32LE(offset) !== 0xFD2FB528) {
+      throw new Error(`invalid Zstandard session frame at byte ${offset}`)
+    }
+    offset += 4
+    const descriptor = buffer.readUInt8(offset++)
+    if ((descriptor & 0x18) !== 0) throw new Error(`invalid Zstandard frame header at byte ${offset - 1}`)
 
-  for (const sample of steps.values()) {
-    uncachedInputTokens += sample.usage.inputTokens
-    outputTokens += sample.usage.outputTokens
-    cacheReadTokens += sample.usage.cacheReadTokens ?? 0
-    cacheWriteTokens += sample.usage.cacheWriteTokens ?? 0
-    reasoningTokens += sample.usage.reasoningTokens ?? 0
-    requestCount += 1
-    if (firstEventTime === 0 || sample.time < firstEventTime) firstEventTime = sample.time
-    if (sample.time > lastEventTime) lastEventTime = sample.time
-    if (sample.provider !== null) provider = sample.provider
-    if (sample.model !== null) model = sample.model
-  }
+    const contentSizeFlag = descriptor >>> 6
+    const singleSegment = (descriptor & 0x20) !== 0
+    const checksum = (descriptor & 0x04) !== 0
+    const dictionaryFlag = descriptor & 0x03
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+    const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
+    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+    if (buffer.length - offset < remainingHeaderBytes) throw new Error(`incomplete Zstandard frame at byte ${start}`)
+    offset += remainingHeaderBytes
 
-  return {
-    uncachedInputTokens,
-    outputTokens,
-    cacheReadTokens,
-    cacheWriteTokens,
-    reasoningTokens,
-    requestCount,
-    firstEventTime,
-    lastEventTime,
-    provider,
-    model,
+    for (;;) {
+      if (buffer.length - offset < 3) throw new Error(`incomplete Zstandard frame at byte ${start}`)
+      const blockHeader = buffer.readUIntLE(offset, 3)
+      offset += 3
+      const lastBlock = (blockHeader & 1) !== 0
+      const blockType = (blockHeader >>> 1) & 0x03
+      const blockSize = blockHeader >>> 3
+      if (blockType === 0x03) throw new Error(`invalid Zstandard block at byte ${offset - 3}`)
+      const payloadBytes = blockType === 0x01 ? 1 : blockSize
+      if (buffer.length - offset < payloadBytes) throw new Error(`incomplete Zstandard frame at byte ${start}`)
+      offset += payloadBytes
+      if (lastBlock) break
+    }
+    if (checksum) {
+      if (buffer.length - offset < 4) throw new Error(`incomplete Zstandard checksum at byte ${start}`)
+      offset += 4
+    }
+    ranges.push({ start, end: offset })
   }
+  return ranges
+}
+
+/**
+ * Token accounting can safely read otherwise-refused v0 events because it only
+ * consumes stable request/usage fields and does not replay session behavior.
+ */
+async function readRefusedV0Events(error: unknown): Promise<readonly SessionEvent[] | undefined> {
+  if (typeof error !== 'object' || error === null) return undefined
+  const refusal = error as {
+    name?: unknown
+    message?: unknown
+    location?: { kind?: unknown; path?: unknown }
+  }
+  const message = typeof refusal.message === 'string' ? refusal.message : ''
+  if (!message.includes('source v0 artifact remains unchanged')) return undefined
+  const path = refusal.location?.kind === 'jsonl' && typeof refusal.location.path === 'string'
+    ? refusal.location.path
+    : /\(raw log: (.+)\)$/.exec(message)?.[1]
+  if (path === undefined) return undefined
+  const source = await readFile(path)
+  const plaintext = path.endsWith('.zstd')
+    ? Buffer.concat(zstdFrameRanges(source).map(({ start, end }) => zstdDecompressSync(source.subarray(start, end))))
+    : source
+  const records = plaintext.toString('utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as unknown)
+  const header = records.shift()
+  if (typeof header !== 'object' || header === null
+    || (header as { type?: unknown }).type !== 'session'
+    || (header as { version?: unknown }).version !== 0) return undefined
+
+  const tokenEventTypes = new Set([
+    'session/title',
+    'request/context',
+    'request/header',
+    'assistant/message',
+    'step/end',
+    'compaction/summary',
+    'web/deepseek-search-llm-request',
+    'turn/end',
+  ])
+  const events: SessionEvent[] = []
+  for (const record of records) {
+    if (typeof record !== 'object' || record === null) throw new Error(`invalid v0 event in ${path}`)
+    const value = record as { type?: unknown; seq?: unknown; time?: unknown }
+    if (typeof value.type !== 'string') throw new Error(`invalid v0 event in ${path}`)
+    if (!tokenEventTypes.has(value.type)) continue
+    if (!Number.isInteger(value.seq) || !Number.isInteger(value.time)) {
+      throw new Error(`invalid v0 event in ${path}`)
+    }
+    events.push(record as SessionEvent)
+  }
+  return events
 }
 
 /** Whether one trustedHosts entry matches a request's Host authority.
@@ -249,17 +319,22 @@ function writeError(res: ServerResponse, status: number, error: unknown): void {
   writeJson(res, status, { ok: false, error: { code: 'error', message } })
 }
 
-type UsageQueryResult = { query: TurnQueryOptions } | { error: string }
+type UsageQueryResult = { query: UsageQueryOptions } | { error: string }
 
-const TIME_FIELD_KEYS: Record<string, { minKey: keyof TurnQueryOptions; maxKey: keyof TurnQueryOptions }> = {
-  last_event_time: { minKey: 'lastEventTimeMin', maxKey: 'lastEventTimeMax' },
-  lastEventTime: { minKey: 'lastEventTimeMin', maxKey: 'lastEventTimeMax' },
-  first_event_time: { minKey: 'firstEventTimeMin', maxKey: 'firstEventTimeMax' },
-  firstEventTime: { minKey: 'firstEventTimeMin', maxKey: 'firstEventTimeMax' },
+const TIME_FIELD_KEYS: Record<string, { minKey: keyof UsageQueryOptions; maxKey: keyof UsageQueryOptions }> = {
+  event_time: { minKey: 'eventTimeMin', maxKey: 'eventTimeMax' },
+  eventTime: { minKey: 'eventTimeMin', maxKey: 'eventTimeMax' },
+  // Backward-compatible aliases from the previous turn-level API.
+  last_event_time: { minKey: 'eventTimeMin', maxKey: 'eventTimeMax' },
+  lastEventTime: { minKey: 'eventTimeMin', maxKey: 'eventTimeMax' },
+  first_event_time: { minKey: 'eventTimeMin', maxKey: 'eventTimeMax' },
+  firstEventTime: { minKey: 'eventTimeMin', maxKey: 'eventTimeMax' },
   session_created_at: { minKey: 'sessionCreatedAtMin', maxKey: 'sessionCreatedAtMax' },
   sessionCreatedAt: { minKey: 'sessionCreatedAtMin', maxKey: 'sessionCreatedAtMax' },
   session_updated_at: { minKey: 'sessionUpdatedAtMin', maxKey: 'sessionUpdatedAtMax' },
   sessionUpdatedAt: { minKey: 'sessionUpdatedAtMin', maxKey: 'sessionUpdatedAtMax' },
+  usage_captured_at: { minKey: 'usageCapturedAtMin', maxKey: 'usageCapturedAtMax' },
+  usageCapturedAt: { minKey: 'usageCapturedAtMin', maxKey: 'usageCapturedAtMax' },
   created_at: { minKey: 'createdAtMin', maxKey: 'createdAtMax' },
   createdAt: { minKey: 'createdAtMin', maxKey: 'createdAtMax' },
   updated_at: { minKey: 'updatedAtMin', maxKey: 'updatedAtMax' },
@@ -299,7 +374,7 @@ function resolveTimeParam(value: string, kind: 'since' | 'until'): number | unde
 
 /** Parse /api/usage query parameters into typed SQL filters. */
 function parseUsageQuery(url: URL): UsageQueryResult {
-  const query: TurnQueryOptions = {}
+  const query: UsageQueryOptions = {}
 
   const readString = (name: string): string | undefined => {
     const value = url.searchParams.get(name)
@@ -333,7 +408,7 @@ function parseUsageQuery(url: URL): UsageQueryResult {
   }
 
   try {
-    const stringFields: { key: keyof TurnQueryOptions; names: string[] }[] = [
+    const stringFields: { key: keyof UsageQueryOptions; names: string[] }[] = [
       { key: 'workspace', names: ['workspace'] },
       { key: 'sessionId', names: ['sessionId', 'session_id'] },
       { key: 'sessionTitle', names: ['sessionTitle', 'session_title'] },
@@ -345,19 +420,36 @@ function parseUsageQuery(url: URL): UsageQueryResult {
       if (value !== undefined) query[field.key] = value as never
     }
 
-    const intFields: { key: keyof TurnQueryOptions; names: string[] }[] = [
+    const kind = readString('kind')
+    if (kind !== undefined) {
+      if (kind !== 'session' && kind !== 'compaction' && kind !== 'session-title' && kind !== 'web-search') {
+        throw new Error('invalid "kind": expected session, compaction, session-title, or web-search')
+      }
+      query.kind = kind
+    }
+    const usageStatus = readStringFrom(['usageStatus', 'usage_status'])
+    if (usageStatus !== undefined) {
+      if (usageStatus !== 'pending' && usageStatus !== 'captured'
+        && usageStatus !== 'missing' && usageStatus !== 'failed') {
+        throw new Error('invalid "usage_status": expected pending, captured, missing, or failed')
+      }
+      query.usageStatus = usageStatus
+    }
+
+    const intFields: { key: keyof UsageQueryOptions; names: string[] }[] = [
       { key: 'id', names: ['id'] },
       { key: 'turn', names: ['turn'] },
-      { key: 'sessionCreatedAt', names: ['sessionCreatedAt', 'session_created_at'] },
-      { key: 'sessionUpdatedAt', names: ['sessionUpdatedAt', 'session_updated_at'] },
+      { key: 'step', names: ['step'] },
+      { key: 'sourceSeq', names: ['sourceSeq', 'source_seq'] },
       { key: 'uncachedInputTokens', names: ['uncachedInputTokens', 'uncached_input_tokens'] },
       { key: 'outputTokens', names: ['outputTokens', 'output_tokens'] },
       { key: 'cacheReadTokens', names: ['cacheReadTokens', 'cache_read_tokens'] },
       { key: 'cacheWriteTokens', names: ['cacheWriteTokens', 'cache_write_tokens'] },
       { key: 'reasoningTokens', names: ['reasoningTokens', 'reasoning_tokens'] },
-      { key: 'requestCount', names: ['requestCount', 'request_count'] },
-      { key: 'firstEventTime', names: ['firstEventTime', 'first_event_time'] },
-      { key: 'lastEventTime', names: ['lastEventTime', 'last_event_time'] },
+      { key: 'sessionCreatedAt', names: ['sessionCreatedAt', 'session_created_at'] },
+      { key: 'sessionUpdatedAt', names: ['sessionUpdatedAt', 'session_updated_at'] },
+      { key: 'eventTime', names: ['eventTime', 'event_time', 'firstEventTime', 'first_event_time', 'lastEventTime', 'last_event_time'] },
+      { key: 'usageCapturedAt', names: ['usageCapturedAt', 'usage_captured_at'] },
       { key: 'createdAt', names: ['createdAt', 'created_at'] },
       { key: 'updatedAt', names: ['updatedAt', 'updated_at'] },
     ]
@@ -366,19 +458,20 @@ function parseUsageQuery(url: URL): UsageQueryResult {
       if (value !== undefined) query[field.key] = value as never
     }
 
-    const rangeFields: { minKey: keyof TurnQueryOptions; maxKey: keyof TurnQueryOptions; minNames: string[]; maxNames: string[] }[] = [
+    const rangeFields: { minKey: keyof UsageQueryOptions; maxKey: keyof UsageQueryOptions; minNames: string[]; maxNames: string[] }[] = [
       { minKey: 'idMin', maxKey: 'idMax', minNames: ['idMin', 'id_min'], maxNames: ['idMax', 'id_max'] },
       { minKey: 'turnMin', maxKey: 'turnMax', minNames: ['turnMin', 'turn_min'], maxNames: ['turnMax', 'turn_max'] },
-      { minKey: 'sessionCreatedAtMin', maxKey: 'sessionCreatedAtMax', minNames: ['sessionCreatedAtMin', 'session_created_at_min'], maxNames: ['sessionCreatedAtMax', 'session_created_at_max'] },
-      { minKey: 'sessionUpdatedAtMin', maxKey: 'sessionUpdatedAtMax', minNames: ['sessionUpdatedAtMin', 'session_updated_at_min'], maxNames: ['sessionUpdatedAtMax', 'session_updated_at_max'] },
+      { minKey: 'stepMin', maxKey: 'stepMax', minNames: ['stepMin', 'step_min'], maxNames: ['stepMax', 'step_max'] },
+      { minKey: 'sourceSeqMin', maxKey: 'sourceSeqMax', minNames: ['sourceSeqMin', 'source_seq_min'], maxNames: ['sourceSeqMax', 'source_seq_max'] },
       { minKey: 'uncachedInputTokensMin', maxKey: 'uncachedInputTokensMax', minNames: ['uncachedInputTokensMin', 'uncached_input_tokens_min'], maxNames: ['uncachedInputTokensMax', 'uncached_input_tokens_max'] },
       { minKey: 'outputTokensMin', maxKey: 'outputTokensMax', minNames: ['outputTokensMin', 'output_tokens_min'], maxNames: ['outputTokensMax', 'output_tokens_max'] },
       { minKey: 'cacheReadTokensMin', maxKey: 'cacheReadTokensMax', minNames: ['cacheReadTokensMin', 'cache_read_tokens_min'], maxNames: ['cacheReadTokensMax', 'cache_read_tokens_max'] },
       { minKey: 'cacheWriteTokensMin', maxKey: 'cacheWriteTokensMax', minNames: ['cacheWriteTokensMin', 'cache_write_tokens_min'], maxNames: ['cacheWriteTokensMax', 'cache_write_tokens_max'] },
       { minKey: 'reasoningTokensMin', maxKey: 'reasoningTokensMax', minNames: ['reasoningTokensMin', 'reasoning_tokens_min'], maxNames: ['reasoningTokensMax', 'reasoning_tokens_max'] },
-      { minKey: 'requestCountMin', maxKey: 'requestCountMax', minNames: ['requestCountMin', 'request_count_min'], maxNames: ['requestCountMax', 'request_count_max'] },
-      { minKey: 'firstEventTimeMin', maxKey: 'firstEventTimeMax', minNames: ['firstEventTimeMin', 'first_event_time_min'], maxNames: ['firstEventTimeMax', 'first_event_time_max'] },
-      { minKey: 'lastEventTimeMin', maxKey: 'lastEventTimeMax', minNames: ['lastEventTimeMin', 'last_event_time_min'], maxNames: ['lastEventTimeMax', 'last_event_time_max'] },
+      { minKey: 'sessionCreatedAtMin', maxKey: 'sessionCreatedAtMax', minNames: ['sessionCreatedAtMin', 'session_created_at_min'], maxNames: ['sessionCreatedAtMax', 'session_created_at_max'] },
+      { minKey: 'sessionUpdatedAtMin', maxKey: 'sessionUpdatedAtMax', minNames: ['sessionUpdatedAtMin', 'session_updated_at_min'], maxNames: ['sessionUpdatedAtMax', 'session_updated_at_max'] },
+      { minKey: 'eventTimeMin', maxKey: 'eventTimeMax', minNames: ['eventTimeMin', 'event_time_min', 'firstEventTimeMin', 'first_event_time_min', 'lastEventTimeMin', 'last_event_time_min'], maxNames: ['eventTimeMax', 'event_time_max', 'firstEventTimeMax', 'first_event_time_max', 'lastEventTimeMax', 'last_event_time_max'] },
+      { minKey: 'usageCapturedAtMin', maxKey: 'usageCapturedAtMax', minNames: ['usageCapturedAtMin', 'usage_captured_at_min'], maxNames: ['usageCapturedAtMax', 'usage_captured_at_max'] },
       { minKey: 'createdAtMin', maxKey: 'createdAtMax', minNames: ['createdAtMin', 'created_at_min'], maxNames: ['createdAtMax', 'created_at_max'] },
       { minKey: 'updatedAtMin', maxKey: 'updatedAtMax', minNames: ['updatedAtMin', 'updated_at_min'], maxNames: ['updatedAtMax', 'updated_at_max'] },
     ]
@@ -394,10 +487,10 @@ function parseUsageQuery(url: URL): UsageQueryResult {
     const untilRaw = url.searchParams.get('until') ?? url.searchParams.get('to')
     const timeFieldRaw = url.searchParams.get('time_field') ?? url.searchParams.get('timeField')
     if (sinceRaw !== null || untilRaw !== null) {
-      const timeField = timeFieldRaw ?? 'last_event_time'
+      const timeField = timeFieldRaw ?? 'event_time'
       const keys = TIME_FIELD_KEYS[timeField]
       if (!keys) {
-        throw new Error('invalid "time_field": expected last_event_time, first_event_time, session_created_at, session_updated_at, created_at, or updated_at')
+        throw new Error('invalid "time_field": expected event_time, usage_captured_at, session_created_at, session_updated_at, created_at, or updated_at')
       }
       if (sinceRaw !== null) {
         const since = resolveTimeParam(sinceRaw, 'since')
@@ -424,12 +517,12 @@ function parseUsageQuery(url: URL): UsageQueryResult {
   }
 }
 
-function totalsFromRecords(records: UnifiedUsageRecord[]): UsageTotals {
+function totalsFromRecords(records: TokenUsageRow[]): UsageTotals {
   const totals: UsageTotals = {
     uncachedInputTokens: 0,
-    outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    outputTokens: 0,
     reasoningTokens: 0,
     requestCount: 0,
     turnCount: 0,
@@ -438,17 +531,21 @@ function totalsFromRecords(records: UnifiedUsageRecord[]): UsageTotals {
   }
   const sessions = new Set<string>()
   const workspaces = new Set<string>()
+  const turns = new Set<string>()
   for (const record of records) {
-    totals.uncachedInputTokens += record.uncachedInputTokens
-    totals.outputTokens += record.outputTokens
-    totals.cacheReadTokens += record.cacheReadTokens
-    totals.cacheWriteTokens += record.cacheWriteTokens
-    totals.reasoningTokens += record.reasoningTokens
-    totals.requestCount += record.requestCount
-    if (record.kind === 'session') totals.turnCount += 1
+    totals.uncachedInputTokens += record.uncachedInputTokens ?? 0
+    totals.outputTokens += record.outputTokens ?? 0
+    totals.cacheReadTokens += record.cacheReadTokens ?? 0
+    totals.cacheWriteTokens += record.cacheWriteTokens ?? 0
+    totals.reasoningTokens += record.reasoningTokens ?? 0
+    totals.requestCount += 1
+    if (record.kind === 'session' && record.turn !== null) {
+      turns.add(`${record.sessionId}\u0000${record.turn}`)
+    }
     sessions.add(record.sessionId)
     workspaces.add(record.workspace)
   }
+  totals.turnCount = turns.size
   totals.sessionCount = sessions.size
   totals.workspaceCount = workspaces.size
   return totals
@@ -457,16 +554,15 @@ function totalsFromRecords(records: UnifiedUsageRecord[]): UsageTotals {
 interface UsageGroup {
   key: Record<string, string | number | null>
   uncachedInputTokens: number
-  outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  outputTokens: number
   reasoningTokens: number
   requestCount: number
-  recordCount: number
   sessionCount: number
 }
 
-function groupsFromRecords(records: UnifiedUsageRecord[], groupBy: string): UsageGroup[] {
+function groupsFromRecords(records: TokenUsageRow[], groupBy: string): UsageGroup[] {
   const buckets = new Map<string, { group: UsageGroup; sessions: Set<string> }>()
   for (const record of records) {
     let key: Record<string, string | number | null>
@@ -496,12 +592,11 @@ function groupsFromRecords(records: UnifiedUsageRecord[], groupBy: string): Usag
         group: {
           key,
           uncachedInputTokens: 0,
-          outputTokens: 0,
           cacheReadTokens: 0,
           cacheWriteTokens: 0,
+          outputTokens: 0,
           reasoningTokens: 0,
           requestCount: 0,
-          recordCount: 0,
           sessionCount: 0,
         },
         sessions: new Set(),
@@ -509,13 +604,12 @@ function groupsFromRecords(records: UnifiedUsageRecord[], groupBy: string): Usag
       buckets.set(id, bucket)
     }
     const group = bucket.group
-    group.uncachedInputTokens += record.uncachedInputTokens
-    group.outputTokens += record.outputTokens
-    group.cacheReadTokens += record.cacheReadTokens
-    group.cacheWriteTokens += record.cacheWriteTokens
-    group.reasoningTokens += record.reasoningTokens
-    group.requestCount += record.requestCount
-    group.recordCount += 1
+    group.uncachedInputTokens += record.uncachedInputTokens ?? 0
+    group.outputTokens += record.outputTokens ?? 0
+    group.cacheReadTokens += record.cacheReadTokens ?? 0
+    group.cacheWriteTokens += record.cacheWriteTokens ?? 0
+    group.reasoningTokens += record.reasoningTokens ?? 0
+    group.requestCount += 1
     bucket.sessions.add(record.sessionId)
   }
   for (const bucket of buckets.values()) {
@@ -544,10 +638,11 @@ export function apply(ctx: PluginContext, config: Config): void {
   const webTrustedHosts = (): readonly string[] =>
     (ctx.get('webRuntime') as { trustedHosts?: readonly string[] } | undefined)?.trustedHosts ?? []
 
-  // Latest provider/model per session; used to enrich assistant/chunk usage.
+  // Latest provider/model per session; used when the final message does not
+  // carry an explicit model source.
   const routeBySession = new Map<SessionLike, { provider?: string; model?: string }>()
-  // Per-session turn accumulator.
-  const turnsBySession = new Map<SessionLike, SessionTurnAccumulator>()
+  // Steps already seen while folding one live or persisted session.
+  const stepsBySession = new Map<SessionLike, Map<number, Set<number>>>()
   // Per-session metadata (title, created/updated timestamps).
   const metaBySession = new Map<SessionLike, SessionMeta>()
   // Pending DeepSeek web-search requests awaiting their fetch response, keyed by
@@ -556,6 +651,7 @@ export function apply(ctx: PluginContext, config: Config): void {
     session: SessionLike
     sourceSeq: number
     model: string
+    eventTime: number
   }>>()
 
   const metaOf = (session: SessionLike): SessionMeta => {
@@ -571,90 +667,41 @@ export function apply(ctx: PluginContext, config: Config): void {
     return meta
   }
 
-  const accumulatorOf = (session: SessionLike): SessionTurnAccumulator => {
-    let turns = turnsBySession.get(session)
-    if (turns === undefined) {
-      turns = new Map()
-      turnsBySession.set(session, turns)
-    }
-    return turns
-  }
-
-  const flushTurn = (session: SessionLike, turn: number): boolean => {
-    const turns = turnsBySession.get(session)
-    if (turns === undefined) return false
-    const steps = turns.get(turn)
-    if (steps === undefined || steps.size === 0) return false
-
-    const aggregated = aggregateStepUsages(steps)
+  const sessionFieldsOf = (session: SessionLike): Pick<TokenUsageRow,
+    'workspace' | 'sessionId' | 'sessionTitle' | 'sessionCreatedAt' | 'sessionUpdatedAt'> => {
     const meta = metaOf(session)
-    store.upsertTurn({
+    return {
       workspace: workspaceOf(session),
       sessionId: session.id,
-      turn,
       sessionTitle: meta.title,
       sessionCreatedAt: meta.createdAt,
       sessionUpdatedAt: meta.updatedAt,
-      provider: aggregated.provider,
-      model: aggregated.model,
-      uncachedInputTokens: aggregated.uncachedInputTokens,
-      outputTokens: aggregated.outputTokens,
-      cacheReadTokens: aggregated.cacheReadTokens,
-      cacheWriteTokens: aggregated.cacheWriteTokens,
-      reasoningTokens: aggregated.reasoningTokens,
-      requestCount: aggregated.requestCount,
-      firstEventTime: aggregated.firstEventTime,
-      lastEventTime: aggregated.lastEventTime,
-    })
-
-    turns.delete(turn)
-    return true
-  }
-
-  /** Write all currently-open turns without deleting the accumulator. */
-  const persistOpenTurns = (session: SessionLike): number => {
-    const turns = turnsBySession.get(session)
-    if (turns === undefined) return 0
-    let count = 0
-    for (const turn of [...turns.keys()]) {
-      const steps = turns.get(turn)
-      if (steps === undefined || steps.size === 0) continue
-      const aggregated = aggregateStepUsages(steps)
-      const meta = metaOf(session)
-      store.upsertTurn({
-        workspace: workspaceOf(session),
-        sessionId: session.id,
-        turn,
-        sessionTitle: meta.title,
-        sessionCreatedAt: meta.createdAt,
-        sessionUpdatedAt: meta.updatedAt,
-        provider: aggregated.provider,
-        model: aggregated.model,
-        uncachedInputTokens: aggregated.uncachedInputTokens,
-        outputTokens: aggregated.outputTokens,
-        cacheReadTokens: aggregated.cacheReadTokens,
-        cacheWriteTokens: aggregated.cacheWriteTokens,
-        reasoningTokens: aggregated.reasoningTokens,
-        requestCount: aggregated.requestCount,
-        firstEventTime: aggregated.firstEventTime,
-        lastEventTime: aggregated.lastEventTime,
-      })
-      count += 1
     }
-    return count
   }
 
-  const flushSession = (session: SessionLike): void => {
-    const turns = turnsBySession.get(session)
-    if (turns === undefined) return
-    for (const turn of [...turns.keys()]) flushTurn(session, turn)
-    turnsBySession.delete(session)
+  const markStep = (session: SessionLike, turn: number, step: number): boolean => {
+    let turns = stepsBySession.get(session)
+    if (turns === undefined) {
+      turns = new Map()
+      stepsBySession.set(session, turns)
+    }
+    let steps = turns.get(turn)
+    if (steps === undefined) {
+      steps = new Set()
+      turns.set(turn, steps)
+    }
+    const isNew = !steps.has(step)
+    steps.add(step)
+    return isNew
   }
+
+  interface ProcessStats { writtenRequests: number }
+  interface ProcessOptions { replay?: boolean; stats?: ProcessStats }
 
   const processEvent = (
     session: SessionLike,
     event: SessionEvent,
-    stats?: { writtenTurns: number },
+    options: ProcessOptions = {},
   ): void => {
     let route = routeBySession.get(session)
     if (route === undefined) {
@@ -666,6 +713,7 @@ export function apply(ctx: PluginContext, config: Config): void {
     if (event.time > meta.updatedAt) meta.updatedAt = event.time
     if (event.type === 'session/title') {
       meta.title = event.data.title
+      store.updateSessionMetadata(sessionFieldsOf(session))
     }
 
     if (event.type === 'request/context') {
@@ -681,109 +729,108 @@ export function apply(ctx: PluginContext, config: Config): void {
       return
     }
 
-    if (event.type === 'assistant/chunk' && event.data.chunk.type === 'usage') {
-      const turns = accumulatorOf(session)
-      let steps = turns.get(event.data.turn)
-      if (steps === undefined) {
-        steps = new Map()
-        turns.set(event.data.turn, steps)
-      }
-      steps.set(event.data.step, {
-        usage: event.data.chunk.usage,
-        provider: route.provider ?? null,
-        model: route.model ?? null,
-        time: event.time,
-      })
-      return
-    }
-
     if (event.type === 'assistant/message' && event.data.usage !== undefined) {
       const source = event.data.message.source
       const provider = source?.kind === 'model' ? source.provider : route.provider
       const model = source?.kind === 'model' ? source.model : route.model
-      const turns = accumulatorOf(session)
-      let steps = turns.get(event.data.turn)
-      if (steps === undefined) {
-        steps = new Map()
-        turns.set(event.data.turn, steps)
-      }
-      // assistant/message is authoritative for the step: it replaces the
-      // earlier assistant/chunk sample for the same (turn, step).
-      steps.set(event.data.step, {
-        usage: event.data.usage,
+      const isNew = markStep(session, event.data.turn, event.data.step)
+      store.upsert({
+        ...sessionFieldsOf(session),
+        kind: 'session',
+        turn: event.data.turn,
+        step: event.data.step,
+        sourceSeq: event.seq,
         provider: provider ?? null,
         model: model ?? null,
-        time: event.time,
+        usageStatus: 'captured',
+        uncachedInputTokens: event.data.usage.inputTokens,
+        cacheReadTokens: event.data.usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: event.data.usage.cacheWriteTokens ?? 0,
+        outputTokens: event.data.usage.outputTokens,
+        reasoningTokens: event.data.usage.reasoningTokens ?? 0,
+        eventTime: event.time,
+        usageCapturedAt: event.time,
       })
+      if (isNew && options.stats !== undefined) options.stats.writtenRequests += 1
       return
     }
 
     if (event.type === 'step/end') {
-      const turns = accumulatorOf(session)
-      let steps = turns.get(event.data.turn)
-      if (steps === undefined) {
-        steps = new Map()
-        turns.set(event.data.turn, steps)
-      }
-      // A step that never reported usage is still a real model request.
-      // Count it as one request with zero known tokens; a later
-      // assistant/message usage (if any) will replace this zero sample.
-      if (!steps.has(event.data.step)) {
-        steps.set(event.data.step, {
-          usage: { inputTokens: 0, outputTokens: 0 },
+      // A step without usage is a known request with unknown token counts.
+      if (markStep(session, event.data.turn, event.data.step)) {
+        store.upsert({
+          ...sessionFieldsOf(session),
+          kind: 'session',
+          turn: event.data.turn,
+          step: event.data.step,
+          sourceSeq: event.seq,
           provider: route.provider ?? null,
           model: route.model ?? null,
-          time: event.time,
+          usageStatus: 'missing',
+          uncachedInputTokens: null,
+          cacheReadTokens: null,
+          cacheWriteTokens: null,
+          outputTokens: null,
+          reasoningTokens: null,
+          eventTime: event.time,
+          usageCapturedAt: null,
         })
+        if (options.stats !== undefined) options.stats.writtenRequests += 1
       }
       return
     }
 
     if (event.type === 'compaction/summary') {
       const usage = event.data.usage
-      store.upsertExtra({
-        workspace: workspaceOf(session),
-        sessionId: session.id,
+      store.upsert({
+        ...sessionFieldsOf(session),
         kind: 'compaction',
         turn: null,
+        step: null,
+        sourceSeq: event.seq,
         provider: event.data.provider,
         model: event.data.model,
-        uncachedInputTokens: usage?.inputTokens ?? 0,
-        outputTokens: usage?.outputTokens ?? 0,
-        cacheReadTokens: usage?.cacheReadTokens ?? 0,
-        cacheWriteTokens: usage?.cacheWriteTokens ?? 0,
-        reasoningTokens: usage?.reasoningTokens ?? 0,
-        requestCount: 1,
+        usageStatus: usage === undefined ? 'missing' : 'captured',
+        uncachedInputTokens: usage?.inputTokens ?? null,
+        cacheReadTokens: usage === undefined ? null : usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: usage === undefined ? null : usage.cacheWriteTokens ?? 0,
+        outputTokens: usage?.outputTokens ?? null,
+        reasoningTokens: usage === undefined ? null : usage.reasoningTokens ?? 0,
         eventTime: event.time,
-        sourceSeq: event.seq,
+        usageCapturedAt: usage === undefined ? null : event.time,
       })
+      if (options.stats !== undefined) options.stats.writtenRequests += 1
       return
     }
 
     if (event.type === 'web/deepseek-search-llm-request') {
-      store.upsertExtra({
-        workspace: workspaceOf(session),
-        sessionId: session.id,
+      const awaitingCapture = options.replay !== true && settings.get().captureWebSearchUsage
+      store.upsert({
+        ...sessionFieldsOf(session),
         kind: 'web-search',
         turn: null,
+        step: null,
+        sourceSeq: event.seq,
         provider: 'deepseek-official',
         model: event.data.body.model,
-        uncachedInputTokens: 0,
-        outputTokens: 0,
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        reasoningTokens: 0,
-        requestCount: 1,
+        usageStatus: awaitingCapture ? 'pending' : 'missing',
+        uncachedInputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        outputTokens: null,
+        reasoningTokens: null,
         eventTime: event.time,
-        sourceSeq: event.seq,
+        usageCapturedAt: null,
       })
-      if (settings.get().captureWebSearchUsage) {
+      if (options.stats !== undefined) options.stats.writtenRequests += 1
+      if (awaitingCapture) {
         const key = JSON.stringify(event.data.body)
         const queue = pendingWebSearches.get(key) ?? []
         queue.push({
           session,
           sourceSeq: event.seq,
           model: event.data.body.model,
+          eventTime: event.time,
         })
         pendingWebSearches.set(key, queue)
       }
@@ -791,64 +838,86 @@ export function apply(ctx: PluginContext, config: Config): void {
     }
 
     if (event.type === 'turn/end') {
-      if (flushTurn(session, event.data.turn) && stats !== undefined) {
-        stats.writtenTurns += 1
-      }
+      store.updateSessionMetadata(sessionFieldsOf(session))
+      stepsBySession.get(session)?.delete(event.data.turn)
     }
   }
 
-  const processSession = (session: SessionLike, stats?: { writtenTurns: number }): void => {
-    for (const event of session.events) processEvent(session, event, stats)
+  const processSession = (session: SessionLike, stats?: ProcessStats): void => {
+    const events = session.events ?? session.snapshotEvents?.() ?? []
+    for (const event of events) processEvent(session, event, { replay: true, stats })
+    store.updateSessionMetadata(sessionFieldsOf(session))
   }
 
-  const scanAllSessions = async (): Promise<{ scanned: number; writtenTurns: number }> => {
+  const scanAllSessions = async (): Promise<{
+    scanned: number
+    writtenRequests: number
+    recoveredV0Sessions: number
+  }> => {
     const headers = await ctx.sessionPersistence.list()
     let scanned = 0
-    let writtenTurns = 0
+    let writtenRequests = 0
+    let recoveredV0Sessions = 0
 
-    for (const header of headers) {
-      const inspection = await ctx.sessionPersistence.inspect(header.id)
-      const sessionLike: SessionLike = {
-        id: header.id,
-        header: inspection.meta,
-        events: inspection.events,
+    for (const snapshot of headers) {
+      let handle: SessionHandle | undefined
+      try {
+        let events: readonly SessionEvent[]
+        try {
+          handle = await ctx.sessionPersistence.open(snapshot.header.id, 'read')
+          events = await handle.read()
+        } catch (error) {
+          const recovered = await readRefusedV0Events(error)
+          if (recovered === undefined) throw error
+          events = recovered
+          recoveredV0Sessions += 1
+          ctx.logger.warn(`dsh-token-sql: token-only fallback read for refused v0 session ${snapshot.header.id}`)
+        }
+        const sessionLike: SessionLike = {
+          id: handle?.id ?? snapshot.header.id,
+          header: handle?.header ?? snapshot.header,
+          events,
+        }
+        const stats = { writtenRequests: 0 }
+        store.transaction(() => processSession(sessionLike, stats))
+        writtenRequests += stats.writtenRequests
+        scanned += 1
+        // The inspected object is ephemeral; do not keep it in memory.
+        stepsBySession.delete(sessionLike)
+        routeBySession.delete(sessionLike)
+        metaBySession.delete(sessionLike)
+      } finally {
+        await handle?.close()
       }
-      const stats = { writtenTurns: 0 }
-      processSession(sessionLike, stats)
-      writtenTurns += stats.writtenTurns
-      writtenTurns += persistOpenTurns(sessionLike)
-      scanned += 1
-      // The inspected object is ephemeral; do not keep it in memory.
-      turnsBySession.delete(sessionLike)
-      routeBySession.delete(sessionLike)
-      metaBySession.delete(sessionLike)
     }
 
-    return { scanned, writtenTurns }
+    store.completeLegacyMigration()
+    return { scanned, writtenRequests, recoveredV0Sessions }
   }
 
   if (config.backfillOnStart) {
     for (const session of ctx.sessions.list()) {
-      processSession(session)
-      // Persist any currently-open turns so live usage is visible even
-      // before the turn ends or the session is disposed.
-      persistOpenTurns(session)
+      store.transaction(() => processSession(session))
     }
+  }
+
+  if (store.needsLegacyRescan) {
+    void scanAllSessions().then(({ scanned, writtenRequests, recoveredV0Sessions }) => {
+      ctx.logger.info(`dsh-token-sql: migrated ${scanned} sessions and ${writtenRequests} requests (${recoveredV0Sessions} refused v0 sessions read with token-only fallback)`)
+    }).catch(error => ctx.logger.error(error))
   }
 
   ctx.on('session/created', (session) => {
     processSession(session)
-    persistOpenTurns(session)
   })
 
   ctx.on('session/event', (session, event) => {
     processEvent(session, event)
-    // Keep in-progress turns visible in /api/usage after each completed step.
-    if (event.type === 'step/end') persistOpenTurns(session)
   })
 
   ctx.on('session/disposed', (session) => {
-    flushSession(session)
+    store.updateSessionMetadata(sessionFieldsOf(session))
+    stepsBySession.delete(session)
     routeBySession.delete(session)
     metaBySession.delete(session)
   })
@@ -862,6 +931,7 @@ export function apply(ctx: PluginContext, config: Config): void {
     if (session === undefined) return next()
 
     let usage: TokenUsage | undefined
+    let failed = false
     const stream = next()
     return (async function* () {
       try {
@@ -869,22 +939,27 @@ export function apply(ctx: PluginContext, config: Config): void {
           if (chunk.type === 'usage') usage = chunk.usage
           yield chunk
         }
+      } catch (error) {
+        failed = true
+        throw error
       } finally {
-        store.upsertExtra({
-          workspace: workspaceOf(session),
-          sessionId: session.id,
+        const eventTime = Date.now()
+        store.insert({
+          ...sessionFieldsOf(session),
           kind: 'session-title',
           turn: null,
+          step: null,
+          sourceSeq: null,
           provider: options.provider,
           model: options.model,
-          uncachedInputTokens: usage?.inputTokens ?? 0,
-          outputTokens: usage?.outputTokens ?? 0,
-          cacheReadTokens: usage?.cacheReadTokens ?? 0,
-          cacheWriteTokens: usage?.cacheWriteTokens ?? 0,
-          reasoningTokens: usage?.reasoningTokens ?? 0,
-          requestCount: 1,
-          eventTime: Date.now(),
-          sourceSeq: null,
+          usageStatus: usage !== undefined ? 'captured' : failed ? 'failed' : 'missing',
+          uncachedInputTokens: usage?.inputTokens ?? null,
+          cacheReadTokens: usage === undefined ? null : usage.cacheReadTokens ?? 0,
+          cacheWriteTokens: usage === undefined ? null : usage.cacheWriteTokens ?? 0,
+          outputTokens: usage?.outputTokens ?? null,
+          reasoningTokens: usage === undefined ? null : usage.reasoningTokens ?? 0,
+          eventTime,
+          usageCapturedAt: usage === undefined ? null : eventTime,
         })
       }
     })()
@@ -922,7 +997,7 @@ export function apply(ctx: PluginContext, config: Config): void {
         const method = (init?.method
           ?? (typeof input !== 'string' && 'method' in input ? input.method : 'GET')
         )?.toUpperCase()
-        let matched: { session: SessionLike; sourceSeq: number; model: string } | undefined
+        let matched: { session: SessionLike; sourceSeq: number; model: string; eventTime: number } | undefined
         if (method === 'POST' && url.includes('/messages')) {
           const bodyText = typeof init?.body === 'string' ? init.body : undefined
           if (bodyText) {
@@ -935,6 +1010,7 @@ export function apply(ctx: PluginContext, config: Config): void {
           const response = await originalFetch!(input, init)
           if (matched) {
             const clone = response.clone()
+            let captured = false
             try {
               const data = await clone.json() as { usage?: {
                 input_tokens?: number
@@ -947,29 +1023,69 @@ export function apply(ctx: PluginContext, config: Config): void {
                 const cacheRead = usage.cache_read_input_tokens ?? 0
                 const cacheWrite = usage.cache_creation_input_tokens ?? 0
                 const inputTokens = Math.max(0, (usage.input_tokens ?? 0) - cacheRead - cacheWrite)
-                store.upsertExtra({
-                  workspace: workspaceOf(matched.session),
-                  sessionId: matched.session.id,
+                store.upsert({
+                  ...sessionFieldsOf(matched.session),
                   kind: 'web-search',
                   turn: null,
+                  step: null,
+                  sourceSeq: matched.sourceSeq,
                   provider: 'deepseek-official',
                   model: matched.model,
+                  usageStatus: 'captured',
                   uncachedInputTokens: inputTokens,
-                  outputTokens: usage.output_tokens ?? 0,
                   cacheReadTokens: cacheRead,
                   cacheWriteTokens: cacheWrite,
+                  outputTokens: usage.output_tokens ?? 0,
                   reasoningTokens: 0,
-                  requestCount: 1,
-                  eventTime: Date.now(),
-                  sourceSeq: matched.sourceSeq,
+                  eventTime: matched.eventTime,
+                  usageCapturedAt: Date.now(),
                 })
+                captured = true
               }
             } catch {
-              // Response parsing failure is non-fatal; keep the zero-token row.
+              // Response parsing failure is non-fatal; record missing usage.
+            }
+            if (!captured) {
+              store.upsert({
+                ...sessionFieldsOf(matched.session),
+                kind: 'web-search',
+                turn: null,
+                step: null,
+                sourceSeq: matched.sourceSeq,
+                provider: 'deepseek-official',
+                model: matched.model,
+                usageStatus: 'missing',
+                uncachedInputTokens: null,
+                cacheReadTokens: null,
+                cacheWriteTokens: null,
+                outputTokens: null,
+                reasoningTokens: null,
+                eventTime: matched.eventTime,
+                usageCapturedAt: null,
+              })
             }
           }
           return response
         } catch (error) {
+          if (matched) {
+            store.upsert({
+              ...sessionFieldsOf(matched.session),
+              kind: 'web-search',
+              turn: null,
+              step: null,
+              sourceSeq: matched.sourceSeq,
+              provider: 'deepseek-official',
+              model: matched.model,
+              usageStatus: 'failed',
+              uncachedInputTokens: null,
+              cacheReadTokens: null,
+              cacheWriteTokens: null,
+              outputTokens: null,
+              reasoningTokens: null,
+              eventTime: matched.eventTime,
+              usageCapturedAt: null,
+            })
+          }
           throw error
         }
       }
@@ -1016,18 +1132,36 @@ export function apply(ctx: PluginContext, config: Config): void {
     },
   }), 'dsh-token-sql: /api routes')
 
-  // GET /api/usage — read the SQLite turn_token_usage data back as JSON.
+  // GET /api/usage — read the unified token_usage table back as JSON.
   // Registered on the harness web server itself, so it is reachable at
   // http://127.0.0.1:3080/api/usage when the host is running on port 3080.
   // Controlled by the `exposeWebApi` setting (Settings > Plugins switch), so
   // the route is mounted/unmounted reactively when the setting changes.
   ctx.effect(() => {
     let disposeUsageRoute: (() => void) | undefined
+    let disposeSchemaRoute: (() => void) | undefined
 
     const mountUsageRoute = (): void => {
       disposeUsageRoute?.()
+      disposeSchemaRoute?.()
       disposeUsageRoute = undefined
+      disposeSchemaRoute = undefined
       if (!settings.get().exposeWebApi) return
+      disposeSchemaRoute = ctx.webServer.register({
+        kind: 'exact',
+        path: '/api/usage/schema',
+        handler: (req: IncomingMessage, res: ServerResponse) => {
+          if (!tokenSqlFence(req, { allowGet: true, trustedHosts: webTrustedHosts() })) {
+            writeError(res, 403, 'forbidden')
+            return
+          }
+          if (req.method !== 'GET') {
+            writeError(res, 405, 'method not allowed')
+            return
+          }
+          writeOk(res, USAGE_HTTP_SCHEMA)
+        },
+      })
       disposeUsageRoute = ctx.webServer.register({
         kind: 'exact',
         path: '/api/usage',
@@ -1044,13 +1178,6 @@ export function apply(ctx: PluginContext, config: Config): void {
             const url = new URL(req.url ?? '/', 'http://dsh.internal')
             const raw = url.searchParams.get('raw') === '1'
               || url.searchParams.get('raw') === 'true'
-            const legacy = url.searchParams.get('legacy') === '1'
-              || url.searchParams.get('legacy') === 'true'
-            const includeExtra = url.searchParams.get('include_extra') === '1'
-              || url.searchParams.get('include_extra') === 'true'
-              || url.searchParams.get('includeExtra') === '1'
-              || url.searchParams.get('includeExtra') === 'true'
-            const kind = url.searchParams.get('kind') ?? undefined
             const groupBy = url.searchParams.get('group_by') ?? url.searchParams.get('groupBy') ?? undefined
             if (groupBy !== undefined
               && groupBy !== 'model' && groupBy !== 'session'
@@ -1066,98 +1193,15 @@ export function apply(ctx: PluginContext, config: Config): void {
             }
             const { query } = parsed
             const { limit, offset, ...baseQuery } = query
-
-            const rows = store.listTurns(baseQuery)
-            const extraRows = store.listExtra(baseQuery)
-            const mainTotals = store.getTotals(baseQuery)
-            const extraTotals = store.getExtraTotals(baseQuery)
-            const mergedTotals = {
-              uncachedInputTokens: mainTotals.uncachedInputTokens + extraTotals.uncachedInputTokens,
-              outputTokens: mainTotals.outputTokens + extraTotals.outputTokens,
-              cacheReadTokens: mainTotals.cacheReadTokens + extraTotals.cacheReadTokens,
-              cacheWriteTokens: mainTotals.cacheWriteTokens + extraTotals.cacheWriteTokens,
-              reasoningTokens: mainTotals.reasoningTokens + extraTotals.reasoningTokens,
-              requestCount: mainTotals.requestCount + extraTotals.requestCount,
-              turnCount: mainTotals.turnCount,
-              sessionCount: mainTotals.sessionCount + extraTotals.sessionCount,
-              workspaceCount: mainTotals.workspaceCount + extraTotals.workspaceCount,
-            }
-
-            if (legacy) {
-              if (raw) {
-                if (includeExtra) {
-                  writeJson(res, 200, { rows, extraRows })
-                } else {
-                  writeJson(res, 200, rows)
-                }
-                return
-              }
-              writeOk(res, {
-                rows,
-                ...(includeExtra ? { extraRows } : {}),
-                totals: mergedTotals,
-              })
-              return
-            }
-
-            const records: UnifiedUsageRecord[] = [
-              ...rows.map((row): UnifiedUsageRecord => ({
-                kind: 'session',
-                workspace: row.workspace,
-                sessionId: row.sessionId,
-                turn: row.turn,
-                provider: row.provider,
-                model: row.model,
-                uncachedInputTokens: row.uncachedInputTokens,
-                outputTokens: row.outputTokens,
-                cacheReadTokens: row.cacheReadTokens,
-                cacheWriteTokens: row.cacheWriteTokens,
-                reasoningTokens: row.reasoningTokens,
-                requestCount: row.requestCount,
-                eventTime: row.lastEventTime,
-                sourceSeq: null,
-                sessionTitle: row.sessionTitle,
-                sessionCreatedAt: row.sessionCreatedAt,
-                sessionUpdatedAt: row.sessionUpdatedAt,
-                firstEventTime: row.firstEventTime,
-                lastEventTime: row.lastEventTime,
-              })),
-              ...extraRows.map((row): UnifiedUsageRecord => ({
-                kind: row.kind,
-                workspace: row.workspace,
-                sessionId: row.sessionId,
-                turn: row.turn,
-                provider: row.provider,
-                model: row.model,
-                uncachedInputTokens: row.uncachedInputTokens,
-                outputTokens: row.outputTokens,
-                cacheReadTokens: row.cacheReadTokens,
-                cacheWriteTokens: row.cacheWriteTokens,
-                reasoningTokens: row.reasoningTokens,
-                requestCount: row.requestCount,
-                eventTime: row.eventTime,
-                sourceSeq: row.sourceSeq,
-                sessionTitle: null,
-                sessionCreatedAt: null,
-                sessionUpdatedAt: null,
-                firstEventTime: null,
-                lastEventTime: null,
-              })),
-            ]
-
-            const filtered = kind === undefined
-              ? records
-              : records.filter(record => record.kind === kind)
-            filtered.sort((a, b) => a.eventTime - b.eventTime || a.sessionId.localeCompare(b.sessionId))
-
-            const totals = totalsFromRecords(filtered)
+            const records = store.list(baseQuery)
+            const totals = totalsFromRecords(records)
             const start = offset ?? 0
             const paged = limit === undefined
-              ? filtered.slice(start)
-              : filtered.slice(start, start + limit)
+              ? records.slice(start)
+              : records.slice(start, start + limit)
 
             if (groupBy !== undefined) {
-              const groups = groupsFromRecords(filtered, groupBy)
+              const groups = groupsFromRecords(records, groupBy)
               if (raw) {
                 writeJson(res, 200, groups)
               } else {
@@ -1183,13 +1227,15 @@ export function apply(ctx: PluginContext, config: Config): void {
     return () => {
       disposeWatcher()
       disposeUsageRoute?.()
+      disposeSchemaRoute?.()
       disposeUsageRoute = undefined
+      disposeSchemaRoute = undefined
     }
-  }, 'dsh-token-sql: /api/usage route')
+  }, 'dsh-token-sql: usage HTTP routes')
 
   ctx.effect(() => () => {
-    // Flush any still-open turns before the database handle closes.
-    for (const session of [...turnsBySession.keys()]) flushSession(session)
+    stepsBySession.clear()
+    routeBySession.clear()
     metaBySession.clear()
     store.close()
   }, 'dsh-token-sql: close sqlite store')

@@ -8,3 +8,4 @@
         path: ''
         backfillOnStart: true
         exposeWebApi: true
+        captureWebSearchUsage: false

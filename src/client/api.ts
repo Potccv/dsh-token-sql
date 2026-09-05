@@ -2,7 +2,8 @@
 
 export interface FullScanResult {
   scanned: number
-  writtenTurns: number
+  writtenRequests: number
+  recoveredV0Sessions: number
 }
 
 export async function triggerFullScan(): Promise<FullScanResult> {

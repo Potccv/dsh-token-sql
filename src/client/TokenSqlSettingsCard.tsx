@@ -163,7 +163,10 @@ export function TokenSqlSettingsCard(_props: Props) {
     setMessage(undefined)
     try {
       const result = await triggerFullScan()
-      setMessage(`扫描完成：${result.scanned} 个会话，写入/更新 ${result.writtenTurns} 个 turn`)
+      const recovered = result.recoveredV0Sessions > 0
+        ? `，兼容读取 ${result.recoveredV0Sessions} 个旧版会话`
+        : ''
+      setMessage(`扫描完成：${result.scanned} 个会话，写入/更新 ${result.writtenRequests} 条请求${recovered}`)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error))
     } finally {
@@ -188,7 +191,7 @@ export function TokenSqlSettingsCard(_props: Props) {
   return (
     <PluginCard
       title="Token SQL"
-      description="将 token usage 按 turn 写入 SQLite"
+      description="将每次 DSH token usage 写入 SQLite"
       state={state}
       onSave={() => { void handleSave() }}
       onDiscard={handleDiscard}

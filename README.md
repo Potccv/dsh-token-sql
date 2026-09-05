@@ -1,17 +1,16 @@
 # dsh-token-sql
 
-将 DeepSeek Harness 会话中产生的 token usage 持久化到 SQLite 的 DSH 宿主插件。主对话按 **turn 聚合**，compaction / session-title / web-search 等额外请求按独立记录保存。
+将 DeepSeek Harness 会话中产生的 token usage 持久化到 SQLite 的 DSH 宿主插件。主对话、compaction、session-title 和 web-search 统一保存在一张请求级表中。
 
 ## 功能
 
-- 主对话按 `workspace -> session_id -> turn` 聚合，每个 turn 汇总该 turn 内所有 step 的 token usage。
-- 同一 step 的 `assistant/chunk` usage 和 `assistant/message` usage 不会重复累计：`assistant/message` 作为该 step 的最终值覆盖早期 chunk 样本。
-- 没有 usage 的 step 也会按 `step/end` 计为一次请求，tokens 记为 0。
+- 主对话每个 `session_id + turn + step` 保存一条请求，模型切换不会混入同一条数据。
+- 没有 usage 的 step 仍保存请求记录，状态记为 `missing`，tokens 使用 `NULL` 表示未知。
 - 支持启动时回填当前已加载会话的历史 usage。
 - 支持全量扫描所有持久化历史会话，并在 Settings > Plugins 中提供“全量扫描所有历史会话”按钮。
 - 支持统计 `compaction/summary`、`session-title`、`web-search` 等额外请求。
 - 支持通过设置开关“捕获 Web 搜索 tokens”，运行时解析 DeepSeek 搜索响应 usage，不修改 DSH 源码。
-- `/api/usage` 默认返回统一的 `records` + `totals`，同时包含主对话和额外请求。
+- `/api/usage` 返回统一的请求级 `records` + `totals`。
 
 ## 安装
 
@@ -43,7 +42,7 @@ pnpm dsh plugin --profile web add file:/path/to/dsh-token-sql
 ```bash
 cd /path/to/deepseek-harness
 # 下载dsh-token-sql.tgz
-pnpm dsh plugin --profile web add ./dsh-token-sql-0.1.2-alpha.2.tgz
+pnpm dsh plugin --profile web add ./dsh-token-sql-0.1.3-alpha.1.tgz
 ```
 
 ### 验证安装
@@ -66,7 +65,7 @@ pnpm dsh plugin --profile web add ./dsh-token-sql-0.1.2-alpha.2.tgz
 }
 ```
 
-如果是 tarball 安装，则依赖记录为 `file:/path/to/dsh-token-sql-0.1.2-alpha.2.tgz`。两种方式安装后，插件文件都会出现在 profile 的 `node_modules/dsh-token-sql` 下。
+如果是 tarball 安装，则依赖记录为 `file:/path/to/dsh-token-sql-0.1.3-alpha.1.tgz`。两种方式安装后，插件文件都会出现在 profile 的 `node_modules/dsh-token-sql` 下。
 
 也可以不启动直接检查组合配置：
 
@@ -110,7 +109,7 @@ dsh plugin --profile web remove dsh-token-sql
 dev_uninject_plugin dsh-token-sql
 ```
 
-或在 DSH 的 super-injector 管理界面中卸载，确保 `/root/.dsh/super-injector/registry.json` 中不再有 `dsh-token-sql`，然后再用官方 `dsh plugin add` 安装。否则同一插件会同时存在官方 bundle 和运行时注入两份实例，重启时可能因重复注册导致无法启动。
+或在 DSH 的 super-injector 管理界面中卸载，确保 `~/.dsh/super-injector/registry.json` 中不再有 `dsh-token-sql`，然后再用官方 `dsh plugin add` 安装。否则同一插件会同时存在官方 bundle 和运行时注入两份实例，重启时可能因重复注册导致无法启动。
 
 ## 存储位置
 
@@ -126,70 +125,38 @@ dev_uninject_plugin dsh-token-sql
 - 未设置 `DSH_HOME` 但设置了 `HOME`：使用 `${HOME}/.dsh/storages/token-usage.sqlite`
 - `DSH_HOME` 和 `HOME` 都为空：回退到 `os.homedir()/.dsh/storages/token-usage.sqlite`（与 DSH 自身的 home 解析一致）
 
-可通过配置 `path` 覆盖。数据库使用 WAL 模式，表结构：
+可通过配置 `path` 覆盖。数据库使用 WAL 模式，仅包含一张用户表 `token_usage`。字段按主键、会话、请求、模型、Token、时间的顺序排列：
 
-```sql
-CREATE TABLE turn_token_usage (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  turn INTEGER NOT NULL,
-  session_title TEXT,
-  session_created_at INTEGER NOT NULL,
-  session_updated_at INTEGER NOT NULL,
-  provider TEXT,
-  model TEXT,
-  uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
-  output_tokens INTEGER NOT NULL DEFAULT 0,
-  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-  request_count INTEGER NOT NULL DEFAULT 0,
-  first_event_time INTEGER NOT NULL,
-  last_event_time INTEGER NOT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  UNIQUE(workspace, session_id, turn)
-);
-```
+| 字段 | 含义 |
+| --- | --- |
+| `id` | 自增整数主键；表示记录写入数据库的先后顺序 |
+| `workspace` | 会话 `cwd` 的目录名 |
+| `session_id` | DSH 会话 ID |
+| `session_title` | 会话最新标题 |
+| `kind` | `session` / `compaction` / `session-title` / `web-search` |
+| `turn` | 主对话轮次；额外请求为 `NULL` |
+| `step` | turn 内模型请求序号；额外请求为 `NULL` |
+| `source_seq` | 对应的 DSH session 事件序号 |
+| `provider` | 模型供应商 |
+| `model` | 模型名称 |
+| `usage_status` | `pending` / `captured` / `missing` / `failed` |
+| `uncached_input_tokens` | 未缓存输入 Token |
+| `cache_read_tokens` | 缓存读取 Token |
+| `cache_write_tokens` | 缓存写入 Token |
+| `output_tokens` | 输出 Token |
+| `reasoning_tokens` | 输出中的推理 Token |
+| `session_created_at` | 会话创建时间 |
+| `session_updated_at` | 会话最后活动时间 |
+| `event_time` | 请求对应的 DSH 事件时间 |
+| `usage_captured_at` | 实际取得 usage 的时间 |
+| `created_at` | 记录首次写入时间 |
+| `updated_at` | 记录最后更新时间 |
 
-额外请求（compaction / session-title / web-search）保存在 `extra_usage` 表：
+Token 和时间均使用整数，时间单位为 Unix 毫秒。`usage_status = captured` 时 Token 字段保存实际值，包括真实的 0；其他状态使用 `NULL` 表示未知。`reasoning_tokens` 已包含在 `output_tokens` 中。
 
-```sql
-CREATE TABLE extra_usage (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  turn INTEGER,
-  provider TEXT,
-  model TEXT,
-  uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
-  output_tokens INTEGER NOT NULL DEFAULT 0,
-  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-  request_count INTEGER NOT NULL DEFAULT 1,
-  event_time INTEGER NOT NULL,
-  source_seq INTEGER,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  UNIQUE(workspace, session_id, kind, source_seq)
-);
-```
+`id` 是自增主键。记录默认按业务时间 `event_time` 升序读取，同一毫秒内再按 `id` 升序排列；`created_at` 表示实际入库时间。表不保存 `record_key` 和 `request_count`。主对话通过 `(session_id, turn, step)` 保证业务唯一；compaction 和 web-search 通过 `(session_id, kind, source_seq)` 保证业务唯一。workspace 不参与唯一判断。session-title 没有可重放事件序号，每次实时生成直接插入独立记录。
 
-其中：
-
-- `workspace` 来自会话 `cwd` 的目录名，例如 `/root/DSHWorkFile/dsh-token-meter` → `dsh-token-meter`
-- `session_id` 是会话唯一 id
-- `turn` 是会话内的轮次
-- `session_title` 是会话标题（来自 `session/title` 事件，last-wins）
-- `session_created_at` 是会话创建时间（来自 `session.header.createdAt`）
-- `session_updated_at` 是会话最后活动时间（处理到的最新事件时间）
-- `request_count` 是该 turn 内的 step 数量；没有 usage 的 step 也会计为 1 次请求，tokens 为 0
-- `reasoning_tokens` 已包含在 `output_tokens` 中，这里单独保存便于查看推理细分
-- `extra_usage.kind` 取值：`compaction` / `session-title` / `web-search`
-- `extra_usage.source_seq` 用于关联 session 事件 seq，避免全量扫描重复写入
+旧版数据库会自动升级到 schema v3。已有统一表数据先按 `event_time` 重排并生成自增 `id`；更早的 `turn_token_usage` 和 `extra_usage` 数据会先迁移额外请求，再自动全量扫描 DSH 历史会话重建请求级主对话数据。扫描成功后删除旧表并把 `PRAGMA user_version` 更新为 3。若 DSH 格式转换器拒绝结构不完整的 v0 会话，插件只读取其中稳定的请求和 usage 字段完成 Token 统计，不修改原会话文件。
 
 ## 配置
 
@@ -217,16 +184,16 @@ CREATE TABLE extra_usage (
   POST /dsh-token-sql/api/scan
   ```
 
-- 该路由使用 `ctx.sessionPersistence.list()` + `inspect()` 遍历 `~/.dsh/sessions/` 下所有持久化会话，并按 `turn` 聚合写入。
+- 该路由使用 `ctx.sessionPersistence.list()` + `open()` / `read()` / `close()` 遍历 `~/.dsh/sessions/` 下所有持久化会话，并按请求写入。
 - 当前 59 个会话全量扫描实测约 5 秒。
 
 ### 如果数据库里已有数据
 
 全量扫描是 **upsert** 语义：
 
-- 唯一键是 `(workspace, session_id, turn)`
-- 已存在的 turn 行会被**更新覆盖**为最新扫描结果
-- 不存在的 turn 行会被**插入**
+- 主对话唯一键是 `(session_id, turn, step)`
+- compaction 和 web-search 唯一键是 `(session_id, kind, source_seq)`
+- 已存在的请求会更新，尚未写入的请求会插入
 - 不会产生重复行，也不会删除历史行
 
 所以可以放心重复点击“全量扫描”，结果保持幂等。
@@ -239,7 +206,15 @@ CREATE TABLE extra_usage (
 GET /api/usage
 ```
 
-默认返回**统一记录 `records` + 汇总 `totals`**，同时包含 `turn_token_usage` 和 `extra_usage` 两张表的数据。
+默认返回统一表中的请求级 `records` 和汇总 `totals`。
+
+数据源结构描述接口：
+
+```text
+GET /api/usage/schema
+```
+
+该接口返回 schema 版本、表名、22 个字段的数据库名称与 JSON 名称、SQLite 类型、是否允许 `NULL`、字段说明、主键、业务唯一键、枚举值、时间单位以及默认排序规则。结构描述与数据接口受同一个“网页 API 映射”开关和安全栅栏控制。
 
 ### 默认响应示例
 
@@ -249,56 +224,61 @@ GET /api/usage
   "value": {
     "records": [
       {
-        "kind": "session",
+        "id": 1,
         "workspace": "dsh-token-meter",
         "sessionId": "session-xxx",
+        "sessionTitle": "分析项目构建失败",
+        "kind": "session",
         "turn": 1,
+        "step": 2,
+        "sourceSeq": 15,
         "provider": "deepseek-official",
         "model": "deepseek-v4-flash",
+        "usageStatus": "captured",
         "uncachedInputTokens": 65,
-        "outputTokens": 154,
         "cacheReadTokens": 1664,
         "cacheWriteTokens": 0,
+        "outputTokens": 154,
         "reasoningTokens": 61,
-        "requestCount": 1,
-        "eventTime": 1787397701899,
-        "sourceSeq": null,
-        "sessionTitle": null,
         "sessionCreatedAt": 1787397701893,
-        "sessionUpdatedAt": 1787397701899,
-        "firstEventTime": 1787397701899,
-        "lastEventTime": 1787397701899
+        "sessionUpdatedAt": 1787397800000,
+        "eventTime": 1787397701899,
+        "usageCapturedAt": 1787397701899,
+        "createdAt": 1787397701905,
+        "updatedAt": 1787397701905
       },
       {
-        "kind": "web-search",
+        "id": 2,
         "workspace": "dsh-token-meter",
         "sessionId": "session-xxx",
+        "sessionTitle": "分析项目构建失败",
+        "kind": "web-search",
         "turn": null,
+        "step": null,
+        "sourceSeq": 63,
         "provider": "deepseek-official",
         "model": "deepseek-v4-flash",
-        "uncachedInputTokens": 8434,
-        "outputTokens": 801,
-        "cacheReadTokens": 640,
-        "cacheWriteTokens": 0,
-        "reasoningTokens": 0,
-        "requestCount": 1,
+        "usageStatus": "missing",
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "outputTokens": null,
+        "reasoningTokens": null,
+        "sessionCreatedAt": 1787397701893,
+        "sessionUpdatedAt": 1787397800000,
         "eventTime": 1787774182605,
-        "sourceSeq": 63738,
-        "sessionTitle": null,
-        "sessionCreatedAt": null,
-        "sessionUpdatedAt": null,
-        "firstEventTime": null,
-        "lastEventTime": null
+        "usageCapturedAt": null,
+        "createdAt": 1787774182610,
+        "updatedAt": 1787774182610
       }
     ],
     "totals": {
       "uncachedInputTokens": 10960511,
-      "outputTokens": 5792598,
       "cacheReadTokens": 2877045888,
       "cacheWriteTokens": 0,
+      "outputTokens": 5792598,
       "reasoningTokens": 2740565,
       "requestCount": 11373,
-      "recordCount": 1114,
       "turnCount": 437,
       "sessionCount": 83,
       "workspaceCount": 12
@@ -309,33 +289,29 @@ GET /api/usage
 
 `kind` 取值：
 
-- `session`：主对话 turn 聚合
+- `session`：主对话中的一次模型请求
 - `compaction`：压缩摘要请求
 - `session-title`：标题生成请求
 - `web-search`：DeepSeek 搜索请求
 
 该接口与全量扫描路由共用同一安全栅栏：只接受来自本机（`127.0.0.1` / `localhost`）或 Harness Web 运行时 `trustedHosts` 中声明的可信 Host（`dsh web --trusted-host ...` / 部署派生 LAN 地址），并拒绝 `sec-fetch-site: cross-site` 请求。
 
-### 兼容旧结构
-
-如果你仍然需要旧的 `rows` / `extraRows` 结构，可以加 `legacy=1`：
-
-```text
-GET /api/usage?legacy=1&include_extra=1
-```
-
 ### 统一记录过滤
 
 | 参数 | 说明 |
 | --- | --- |
+| `id` | 按自增主键过滤；也支持 `id_min` / `id_max` 范围 |
 | `kind` | 按记录类型过滤：`session` / `compaction` / `session-title` / `web-search` |
 | `workspace` | 按 workspace 过滤 |
 | `session_id` / `sessionId` | 按 session 过滤 |
 | `provider` | 按 provider 过滤 |
 | `model` | 按 model 过滤 |
+| `usage_status` / `usageStatus` | 按 usage 状态过滤 |
 | `turn` | 按 turn 过滤（主对话） |
+| `step` | 按 step 过滤（主对话） |
+| `source_seq` / `sourceSeq` | 按 DSH 事件序号过滤 |
 | `since` / `until` | 按时间范围过滤 |
-| `time_field` / `timeField` | 选择时间字段，默认 `last_event_time` |
+| `time_field` / `timeField` | 选择时间字段，默认 `event_time` |
 
 示例：
 
@@ -378,12 +354,11 @@ GET /api/usage?group_by=workspace
           "model": "deepseek-v4-flash"
         },
         "uncachedInputTokens": 1000000,
-        "outputTokens": 500000,
         "cacheReadTokens": 8000000,
         "cacheWriteTokens": 0,
+        "outputTokens": 500000,
         "reasoningTokens": 200000,
         "requestCount": 5000,
-        "recordCount": 5000,
         "sessionCount": 30
       }
     ],
@@ -401,7 +376,6 @@ GET /api/usage?group_by=workspace
 | `limit` | 返回记录数上限（非负整数） |
 | `offset` | 跳过前面的记录数（非负整数） |
 | `raw=1` / `raw=true` | 直接返回裸 `records` 数组，不包 `{ ok, value }` |
-| `legacy=1` / `legacy=true` | 使用旧结构 `rows` / `extraRows` |
 
 `totals` 会跟随所有过滤条件一起汇总；`limit` / `offset` 只影响返回的记录列表。
 
@@ -415,7 +389,7 @@ npm run typecheck   # 仅类型检查
 构建脚本会自动探测 DeepSeek Harness checkout；也可显式设置：
 
 ```bash
-DSH_CHECKOUT=/root/deepseek-harness npm run build
+DSH_CHECKOUT=/path/to/deepseek-harness npm run build
 ```
 
 ## 说明
