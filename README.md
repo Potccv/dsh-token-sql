@@ -314,7 +314,7 @@ GET /api/usage
 - `session-title`：标题生成请求
 - `web-search`：DeepSeek 搜索请求
 
-该接口与全量扫描一样有 loopback fence，只接受来自本机（`127.0.0.1` / `localhost`）的 GET 请求。
+该接口与全量扫描路由共用同一安全栅栏：只接受来自本机（`127.0.0.1` / `localhost`）或 Harness Web 运行时 `trustedHosts` 中声明的可信 Host（`dsh web --trusted-host ...` / 部署派生 LAN 地址），并拒绝 `sec-fetch-site: cross-site` 请求。
 
 ### 兼容旧结构
 

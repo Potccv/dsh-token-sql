@@ -185,10 +185,30 @@ function aggregateStepUsages(steps: Map<number, StepUsage>): {
   }
 }
 
-/** Minimal loopback/CSRF fence for local dsh-token-sql routes.
+/** Whether one trustedHosts entry matches a request's Host authority.
+ *  A port-less entry matches the hostname on any port; an entry with a port
+ *  must match exactly (mirrors the Harness /api browser-trust fence). */
+function trustedAuthorityMatches(hostUrl: URL, entry: string): boolean {
+  try {
+    const entryUrl = new URL(`http://${entry}`)
+    return entryUrl.port === ''
+      ? hostUrl.hostname === entryUrl.hostname
+      : hostUrl.host === entryUrl.host
+  } catch {
+    return false
+  }
+}
+
+/** Minimal loopback/trusted-host + CSRF fence for dsh-token-sql routes.
+ *  The loopback-only behavior is extended with the Harness web runtime's
+ *  trustedHosts so `/api/usage` and the scan route work when the GUI is
+ *  reached through a trusted host / reverse proxy.
  *  POST routes still require a JSON content type; GET read routes skip that
  *  requirement so they can be called from a browser or curl without a body. */
-function tokenSqlFence(req: IncomingMessage, opts: { allowGet?: boolean } = {}): boolean {
+function tokenSqlFence(req: IncomingMessage, opts: {
+  allowGet?: boolean
+  trustedHosts?: readonly string[]
+} = {}): boolean {
   const host = req.headers.host
   if (host === undefined) return false
   try {
@@ -198,7 +218,8 @@ function tokenSqlFence(req: IncomingMessage, opts: { allowGet?: boolean } = {}):
       || hostname === '[::1]'
       || hostname === '::1'
       || /^127(\.\d{1,3}){3}$/.test(hostname)
-    if (!loopback) return false
+    const trusted = (opts.trustedHosts ?? []).some(entry => trustedAuthorityMatches(url, entry))
+    if (!loopback && !trusted) return false
   } catch {
     return false
   }
@@ -515,6 +536,13 @@ export function apply(ctx: PluginContext, config: Config): void {
 
   // Register the settings namespace so Settings > Plugins shows this plugin's card.
   const settings = ctx.settings.register(SETTINGS_NS, Config, { base: config })
+
+  // Harness web runtime exposes the authorities accepted by the /api browser
+  // trust fence. Reuse them so this plugin's routes work behind the same
+  // trusted-host/reverse-proxy deployments while staying loopback-only in
+  // plain local profiles where webRuntime is absent.
+  const webTrustedHosts = (): readonly string[] =>
+    (ctx.get('webRuntime') as { trustedHosts?: readonly string[] } | undefined)?.trustedHosts ?? []
 
   // Latest provider/model per session; used to enrich assistant/chunk usage.
   const routeBySession = new Map<SessionLike, { provider?: string; model?: string }>()
@@ -967,7 +995,7 @@ export function apply(ctx: PluginContext, config: Config): void {
     kind: 'prefix',
     path: '/dsh-token-sql/api',
     handler: async (req: IncomingMessage, res: ServerResponse) => {
-      if (!tokenSqlFence(req)) {
+      if (!tokenSqlFence(req, { trustedHosts: webTrustedHosts() })) {
         writeError(res, 403, 'forbidden')
         return
       }
@@ -1004,7 +1032,7 @@ export function apply(ctx: PluginContext, config: Config): void {
         kind: 'exact',
         path: '/api/usage',
         handler: (req: IncomingMessage, res: ServerResponse) => {
-          if (!tokenSqlFence(req, { allowGet: true })) {
+          if (!tokenSqlFence(req, { allowGet: true, trustedHosts: webTrustedHosts() })) {
             writeError(res, 403, 'forbidden')
             return
           }
