@@ -3,6 +3,7 @@
 export interface FullScanResult {
   scanned: number
   writtenRequests: number
+  removedStaleRequests: number
   recoveredV0Sessions: number
 }
 

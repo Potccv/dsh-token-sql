@@ -156,7 +156,7 @@ Token 和时间均使用整数，时间单位为 Unix 毫秒。`usage_status = c
 
 `id` 是自增主键。记录默认按业务时间 `event_time` 升序读取，同一毫秒内再按 `id` 升序排列；`created_at` 表示实际入库时间。表不保存 `record_key` 和 `request_count`。主对话通过 `(session_id, turn, step)` 保证业务唯一；compaction 和 web-search 通过 `(session_id, kind, source_seq)` 保证业务唯一。workspace 不参与唯一判断。session-title 没有可重放事件序号，每次实时生成直接插入独立记录。
 
-旧版数据库会自动升级到 schema v3。已有统一表数据先按 `event_time` 重排并生成自增 `id`；更早的 `turn_token_usage` 和 `extra_usage` 数据会先迁移额外请求，再自动全量扫描 DSH 历史会话重建请求级主对话数据。扫描成功后删除旧表并把 `PRAGMA user_version` 更新为 3。若 DSH 格式转换器拒绝结构不完整的 v0 会话，插件只读取其中稳定的请求和 usage 字段完成 Token 统计，不修改原会话文件。
+当前表结构版本和 SQLite 的 `PRAGMA user_version` 均为新建数据库的默认值 0。插件根据旧表是否存在判断是否需要迁移，不使用开发阶段的版本编号：已有统一表数据先按 `event_time` 重排并生成自增 `id`；旧的 `turn_token_usage` 和 `extra_usage` 数据会先迁移额外请求，再自动全量扫描 DSH 历史会话重建请求级主对话数据。扫描同时对账格式转换前后的额外请求：若转换重排了 `source_seq`，保留当前事件键并清理旧键；旧键含有已捕获的 web-search usage 时会先转移 usage。扫描成功后删除旧表，并保持 `PRAGMA user_version` 为 0。若 DSH 格式转换器拒绝结构不完整的 v0 会话，插件只读取其中稳定的请求和 usage 字段完成 Token 统计，不修改原会话文件。
 
 ## 配置
 
@@ -194,6 +194,7 @@ Token 和时间均使用整数，时间单位为 Unix 毫秒。`usage_status = c
 - 主对话唯一键是 `(session_id, turn, step)`
 - compaction 和 web-search 唯一键是 `(session_id, kind, source_seq)`
 - 已存在的请求会更新，尚未写入的请求会插入
+- 格式转换后 `source_seq` 改变的搜索/压缩请求会与当前事件流对账，清理旧键记录
 - 不会产生重复行，也不会删除历史行
 
 所以可以放心重复点击“全量扫描”，结果保持幂等。

@@ -166,7 +166,10 @@ export function TokenSqlSettingsCard(_props: Props) {
       const recovered = result.recoveredV0Sessions > 0
         ? `，兼容读取 ${result.recoveredV0Sessions} 个旧版会话`
         : ''
-      setMessage(`扫描完成：${result.scanned} 个会话，写入/更新 ${result.writtenRequests} 条请求${recovered}`)
+      const reconciled = result.removedStaleRequests > 0
+        ? `，清理 ${result.removedStaleRequests} 条格式转换产生的陈旧记录`
+        : ''
+      setMessage(`扫描完成：${result.scanned} 个会话，写入/更新 ${result.writtenRequests} 条请求${reconciled}${recovered}`)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error))
     } finally {

@@ -41,6 +41,11 @@ export interface SessionMetadata {
   sessionUpdatedAt: number
 }
 
+export interface SequencedRequestKeys {
+  compactionSourceSeqs: ReadonlySet<number>
+  webSearchSourceSeqs: ReadonlySet<number>
+}
+
 export interface UsageTotals {
   uncachedInputTokens: number
   cacheReadTokens: number
@@ -120,15 +125,22 @@ export interface TokenUsageStore {
   /** Run one synchronous batch atomically. */
   transaction<T>(action: () => T): T
   updateSessionMetadata(meta: SessionMetadata): void
+  /** Remove old-format sequenced rows that duplicate requests in the current event stream. */
+  reconcileSequencedRequests(
+    sessionId: string,
+    current: SequencedRequestKeys,
+    scanStartedAt: number,
+    allowLegacyCapturedTimeMatch: boolean,
+  ): number
   list(options?: UsageQueryOptions): TokenUsageRow[]
-  /** Existing v1 databases require one full session rescan before legacy tables can be removed. */
-  readonly needsLegacyRescan: boolean
-  completeLegacyMigration(): void
+  /** A schema migration requires one successful full scan before it is complete. */
+  readonly needsFullRescan: boolean
+  completeFullRescan(): void
   close(): void
 }
 
-export const TOKEN_USAGE_SCHEMA_VERSION = 3
-const SCHEMA_VERSION = TOKEN_USAGE_SCHEMA_VERSION
+export const TOKEN_USAGE_SCHEMA_VERSION = 0
+const DEFAULT_USER_VERSION = TOKEN_USAGE_SCHEMA_VERSION
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS token_usage (
@@ -506,6 +518,28 @@ function insertParams(row: TokenUsageRow, now: number): (string | number | null)
   ]
 }
 
+interface SequencedDatabaseRow {
+  id: number
+  kind: 'compaction' | 'web-search'
+  sourceSeq: number
+  provider: string | null
+  model: string | null
+  usageStatus: UsageStatus
+  uncachedInputTokens: number | null
+  cacheReadTokens: number | null
+  cacheWriteTokens: number | null
+  outputTokens: number | null
+  reasoningTokens: number | null
+  eventTime: number
+  usageCapturedAt: number | null
+  createdAt: number
+  updatedAt: number
+}
+
+function sequencedSemanticKey(row: SequencedDatabaseRow): string {
+  return JSON.stringify([row.kind, row.eventTime, row.provider, row.model])
+}
+
 export function openTokenUsageStore(filePath: string): TokenUsageStore {
   const absolutePath = resolve(filePath)
   mkdirSync(dirname(absolutePath), { recursive: true })
@@ -515,24 +549,18 @@ export function openTokenUsageStore(filePath: string): TokenUsageStore {
   db.exec('PRAGMA synchronous = NORMAL;')
   db.exec('PRAGMA busy_timeout = 5000;')
 
-  const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
-  if (version > SCHEMA_VERSION) {
-    db.close()
-    throw new Error(`token usage database schema ${version} is newer than supported schema ${SCHEMA_VERSION}`)
-  }
   const hasLegacyTurns = tableExists(db, 'turn_token_usage')
-  let needsLegacyRescan = version < SCHEMA_VERSION && hasLegacyTurns
+  const hasLegacyExtra = tableExists(db, 'extra_usage')
+  let needsFullRescan = hasLegacyTurns || hasLegacyExtra
 
   db.exec('BEGIN IMMEDIATE;')
   try {
     ensureCurrentSchema(db)
-    if (version === 0 && (hasLegacyTurns || tableExists(db, 'extra_usage'))) {
+    if (hasLegacyTurns || hasLegacyExtra) {
       migrateLegacyExtraUsage(db)
     }
-    if (needsLegacyRescan) {
-      db.exec('PRAGMA user_version = 1;')
-    } else {
-      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`)
+    db.exec(`PRAGMA user_version = ${DEFAULT_USER_VERSION};`)
+    if (!needsFullRescan) {
       db.exec('DROP TABLE IF EXISTS turn_token_usage;')
       db.exec('DROP TABLE IF EXISTS extra_usage;')
     }
@@ -555,6 +583,40 @@ export function openTokenUsageStore(filePath: string): TokenUsageStore {
     SELECT usage_status AS usageStatus FROM token_usage
     WHERE session_id = ? AND kind = ? AND source_seq = ?
   `)
+  const listSequencedRequests = db.prepare(`
+    SELECT
+      id,
+      kind,
+      source_seq AS sourceSeq,
+      provider,
+      model,
+      usage_status AS usageStatus,
+      uncached_input_tokens AS uncachedInputTokens,
+      cache_read_tokens AS cacheReadTokens,
+      cache_write_tokens AS cacheWriteTokens,
+      output_tokens AS outputTokens,
+      reasoning_tokens AS reasoningTokens,
+      event_time AS eventTime,
+      usage_captured_at AS usageCapturedAt,
+      created_at AS createdAt,
+      updated_at AS updatedAt
+    FROM token_usage
+    WHERE session_id = ? AND kind IN ('compaction', 'web-search')
+  `)
+  const transferCapturedUsage = db.prepare(`
+    UPDATE token_usage SET
+      usage_status = 'captured',
+      uncached_input_tokens = ?,
+      cache_read_tokens = ?,
+      cache_write_tokens = ?,
+      output_tokens = ?,
+      reasoning_tokens = ?,
+      usage_captured_at = ?,
+      created_at = MIN(created_at, ?),
+      updated_at = MAX(updated_at, ?)
+    WHERE id = ?
+  `)
+  const deleteById = db.prepare('DELETE FROM token_usage WHERE id = ?')
 
   const updateSessionRow = (row: TokenUsageRow, now: number): void => {
     updateSessionRequest.run(
@@ -629,6 +691,89 @@ export function openTokenUsageStore(filePath: string): TokenUsageStore {
       }
     },
     updateSessionMetadata,
+    reconcileSequencedRequests(sessionId, current, scanStartedAt, allowLegacyCapturedTimeMatch) {
+      const rows = listSequencedRequests.all(sessionId) as unknown as SequencedDatabaseRow[]
+      const currentRows = rows.filter((row) => {
+        const sourceSeqs = row.kind === 'compaction'
+          ? current.compactionSourceSeqs
+          : current.webSearchSourceSeqs
+        return sourceSeqs.has(row.sourceSeq)
+      })
+      const currentBySemanticKey = new Map<string, SequencedDatabaseRow[]>()
+      for (const row of currentRows) {
+        const key = sequencedSemanticKey(row)
+        const matches = currentBySemanticKey.get(key) ?? []
+        matches.push(row)
+        currentBySemanticKey.set(key, matches)
+      }
+
+      const staleRows = rows.filter((row) => {
+        if (row.createdAt > scanStartedAt) return false
+        const sourceSeqs = row.kind === 'compaction'
+          ? current.compactionSourceSeqs
+          : current.webSearchSourceSeqs
+        return !sourceSeqs.has(row.sourceSeq)
+      })
+      const claimedCurrentIds = new Set<number>()
+      const legacyCapturedRows: SequencedDatabaseRow[] = []
+      let removed = 0
+
+      const transferUsage = (stale: SequencedDatabaseRow, target: SequencedDatabaseRow): void => {
+        if (stale.usageStatus !== 'captured' || target.usageStatus === 'captured') return
+        transferCapturedUsage.run(
+          stale.uncachedInputTokens,
+          stale.cacheReadTokens,
+          stale.cacheWriteTokens,
+          stale.outputTokens,
+          stale.reasoningTokens,
+          stale.usageCapturedAt,
+          stale.createdAt,
+          stale.updatedAt,
+          target.id,
+        )
+        target.usageStatus = 'captured'
+      }
+
+      for (const stale of staleRows) {
+        const currentMatches = currentBySemanticKey.get(sequencedSemanticKey(stale))
+        if (currentMatches === undefined || currentMatches.length === 0) {
+          if (allowLegacyCapturedTimeMatch && stale.usageStatus === 'captured') {
+            legacyCapturedRows.push(stale)
+          }
+          continue
+        }
+        const target = currentMatches.find(row => !claimedCurrentIds.has(row.id)) ?? currentMatches[0]
+        claimedCurrentIds.add(target.id)
+        transferUsage(stale, target)
+        deleteById.run(stale.id)
+        removed += 1
+      }
+
+      // Earlier development builds replaced a live web-search request's event_time
+      // with response time. Pair those old rows to the nearest unmatched current
+      // request in the same session/model, then preserve their usage on the
+      // current source_seq. This compatibility path runs only for migration.
+      if (allowLegacyCapturedTimeMatch) {
+        const maxResponseDelayMs = 30 * 60 * 1000
+        for (const stale of legacyCapturedRows) {
+          const target = currentRows
+            .filter(row => !claimedCurrentIds.has(row.id)
+              && row.kind === stale.kind
+              && row.provider === stale.provider
+              && row.model === stale.model
+              && row.usageStatus !== 'captured'
+              && row.eventTime <= stale.eventTime
+              && stale.eventTime - row.eventTime <= maxResponseDelayMs)
+            .sort((a, b) => Math.abs(stale.eventTime - a.eventTime) - Math.abs(stale.eventTime - b.eventTime))[0]
+          if (target === undefined) continue
+          claimedCurrentIds.add(target.id)
+          transferUsage(stale, target)
+          deleteById.run(stale.id)
+          removed += 1
+        }
+      }
+      return removed
+    },
     list(options) {
       const { where, params } = buildWhere(options)
       let sql = `${LIST_BASE}${where} ORDER BY event_time, id`
@@ -642,18 +787,18 @@ export function openTokenUsageStore(filePath: string): TokenUsageStore {
       }
       return db.prepare(sql).all(...params) as unknown as TokenUsageRow[]
     },
-    get needsLegacyRescan() {
-      return needsLegacyRescan
+    get needsFullRescan() {
+      return needsFullRescan
     },
-    completeLegacyMigration() {
-      if (!needsLegacyRescan) return
+    completeFullRescan() {
+      if (!needsFullRescan) return
       db.exec('BEGIN IMMEDIATE;')
       try {
         db.exec('DROP TABLE IF EXISTS turn_token_usage;')
         db.exec('DROP TABLE IF EXISTS extra_usage;')
-        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`)
+        db.exec(`PRAGMA user_version = ${DEFAULT_USER_VERSION};`)
         db.exec('COMMIT;')
-        needsLegacyRescan = false
+        needsFullRescan = false
       } catch (error) {
         db.exec('ROLLBACK;')
         throw error

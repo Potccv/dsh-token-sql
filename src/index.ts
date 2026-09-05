@@ -695,8 +695,19 @@ export function apply(ctx: PluginContext, config: Config): void {
     return isNew
   }
 
-  interface ProcessStats { writtenRequests: number }
-  interface ProcessOptions { replay?: boolean; stats?: ProcessStats }
+  interface ProcessStats {
+    writtenRequests: number
+    removedStaleRequests: number
+  }
+  interface SequencedKeys {
+    compactionSourceSeqs: Set<number>
+    webSearchSourceSeqs: Set<number>
+  }
+  interface ProcessOptions {
+    replay?: boolean
+    stats?: ProcessStats
+    sequencedKeys?: SequencedKeys
+  }
 
   const processEvent = (
     session: SessionLike,
@@ -781,6 +792,7 @@ export function apply(ctx: PluginContext, config: Config): void {
     }
 
     if (event.type === 'compaction/summary') {
+      options.sequencedKeys?.compactionSourceSeqs.add(event.seq)
       const usage = event.data.usage
       store.upsert({
         ...sessionFieldsOf(session),
@@ -804,6 +816,7 @@ export function apply(ctx: PluginContext, config: Config): void {
     }
 
     if (event.type === 'web/deepseek-search-llm-request') {
+      options.sequencedKeys?.webSearchSourceSeqs.add(event.seq)
       const awaitingCapture = options.replay !== true && settings.get().captureWebSearchUsage
       store.upsert({
         ...sessionFieldsOf(session),
@@ -843,56 +856,95 @@ export function apply(ctx: PluginContext, config: Config): void {
     }
   }
 
-  const processSession = (session: SessionLike, stats?: ProcessStats): void => {
+  const processSession = (
+    session: SessionLike,
+    stats?: ProcessStats,
+    reconcile = false,
+    scanStartedAt = Date.now(),
+    allowLegacyCapturedTimeMatch = false,
+  ): void => {
     const events = session.events ?? session.snapshotEvents?.() ?? []
-    for (const event of events) processEvent(session, event, { replay: true, stats })
+    const sequencedKeys: SequencedKeys = {
+      compactionSourceSeqs: new Set(),
+      webSearchSourceSeqs: new Set(),
+    }
+    for (const event of events) processEvent(session, event, { replay: true, stats, sequencedKeys })
     store.updateSessionMetadata(sessionFieldsOf(session))
+    if (reconcile) {
+      const removed = store.reconcileSequencedRequests(
+        session.id,
+        sequencedKeys,
+        scanStartedAt,
+        allowLegacyCapturedTimeMatch,
+      )
+      if (stats !== undefined) stats.removedStaleRequests += removed
+    }
   }
 
   const scanAllSessions = async (): Promise<{
     scanned: number
     writtenRequests: number
+    removedStaleRequests: number
     recoveredV0Sessions: number
   }> => {
+    const allowLegacyCapturedTimeMatch = store.needsFullRescan
     const headers = await ctx.sessionPersistence.list()
     let scanned = 0
     let writtenRequests = 0
+    let removedStaleRequests = 0
     let recoveredV0Sessions = 0
 
     for (const snapshot of headers) {
       let handle: SessionHandle | undefined
+      let ephemeral = false
       try {
-        let events: readonly SessionEvent[]
-        try {
-          handle = await ctx.sessionPersistence.open(snapshot.header.id, 'read')
-          events = await handle.read()
-        } catch (error) {
-          const recovered = await readRefusedV0Events(error)
-          if (recovered === undefined) throw error
-          events = recovered
-          recoveredV0Sessions += 1
-          ctx.logger.warn(`dsh-token-sql: token-only fallback read for refused v0 session ${snapshot.header.id}`)
+        const liveSession = ctx.sessions.list().find(session => session.id === snapshot.header.id)
+        let sessionLike: SessionLike
+        const scanStartedAt = Date.now()
+        if (liveSession !== undefined) {
+          sessionLike = liveSession
+        } else {
+          let events: readonly SessionEvent[]
+          try {
+            handle = await ctx.sessionPersistence.open(snapshot.header.id, 'read')
+            events = await handle.read()
+          } catch (error) {
+            const recovered = await readRefusedV0Events(error)
+            if (recovered === undefined) throw error
+            events = recovered
+            recoveredV0Sessions += 1
+            ctx.logger.warn(`dsh-token-sql: token-only fallback read for refused v0 session ${snapshot.header.id}`)
+          }
+          sessionLike = {
+            id: handle?.id ?? snapshot.header.id,
+            header: handle?.header ?? snapshot.header,
+            events,
+          }
+          ephemeral = true
         }
-        const sessionLike: SessionLike = {
-          id: handle?.id ?? snapshot.header.id,
-          header: handle?.header ?? snapshot.header,
-          events,
-        }
-        const stats = { writtenRequests: 0 }
-        store.transaction(() => processSession(sessionLike, stats))
+        const stats = { writtenRequests: 0, removedStaleRequests: 0 }
+        store.transaction(() => processSession(
+          sessionLike,
+          stats,
+          true,
+          scanStartedAt,
+          allowLegacyCapturedTimeMatch,
+        ))
         writtenRequests += stats.writtenRequests
+        removedStaleRequests += stats.removedStaleRequests
         scanned += 1
-        // The inspected object is ephemeral; do not keep it in memory.
-        stepsBySession.delete(sessionLike)
-        routeBySession.delete(sessionLike)
-        metaBySession.delete(sessionLike)
+        if (ephemeral) {
+          stepsBySession.delete(sessionLike)
+          routeBySession.delete(sessionLike)
+          metaBySession.delete(sessionLike)
+        }
       } finally {
         await handle?.close()
       }
     }
 
-    store.completeLegacyMigration()
-    return { scanned, writtenRequests, recoveredV0Sessions }
+    store.completeFullRescan()
+    return { scanned, writtenRequests, removedStaleRequests, recoveredV0Sessions }
   }
 
   if (config.backfillOnStart) {
@@ -901,9 +953,9 @@ export function apply(ctx: PluginContext, config: Config): void {
     }
   }
 
-  if (store.needsLegacyRescan) {
-    void scanAllSessions().then(({ scanned, writtenRequests, recoveredV0Sessions }) => {
-      ctx.logger.info(`dsh-token-sql: migrated ${scanned} sessions and ${writtenRequests} requests (${recoveredV0Sessions} refused v0 sessions read with token-only fallback)`)
+  if (store.needsFullRescan) {
+    void scanAllSessions().then(({ scanned, writtenRequests, removedStaleRequests, recoveredV0Sessions }) => {
+      ctx.logger.info(`dsh-token-sql: migrated ${scanned} sessions and ${writtenRequests} requests; removed ${removedStaleRequests} stale requests (${recoveredV0Sessions} refused v0 sessions read with token-only fallback)`)
     }).catch(error => ctx.logger.error(error))
   }
 
