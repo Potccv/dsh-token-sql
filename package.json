@@ -1,6 +1,6 @@
 {
   "name": "dsh-token-sql",
-  "version": "0.0.1",
+  "version": "0.1.2-alpha.2",
   "description": "Persist DeepSeek Harness token usage into SQLite, aggregated per turn, with a Settings > Plugins full-scan button",
   "private": true,
   "type": "module",

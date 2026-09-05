@@ -43,7 +43,7 @@ pnpm dsh plugin --profile web add file:/path/to/dsh-token-sql
 ```bash
 cd /path/to/deepseek-harness
 # 下载dsh-token-sql.tgz
-pnpm dsh plugin --profile web add ./dsh-token-sql-0.0.1.tgz
+pnpm dsh plugin --profile web add ./dsh-token-sql-0.1.2-alpha.2.tgz
 ```
 
 ### 验证安装
@@ -66,7 +66,7 @@ pnpm dsh plugin --profile web add ./dsh-token-sql-0.0.1.tgz
 }
 ```
 
-如果是 tarball 安装，则依赖记录为 `file:/path/to/dsh-token-sql-0.0.1.tgz`。两种方式安装后，插件文件都会出现在 profile 的 `node_modules/dsh-token-sql` 下。
+如果是 tarball 安装，则依赖记录为 `file:/path/to/dsh-token-sql-0.1.2-alpha.2.tgz`。两种方式安装后，插件文件都会出现在 profile 的 `node_modules/dsh-token-sql` 下。
 
 也可以不启动直接检查组合配置：
 
